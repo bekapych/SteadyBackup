@@ -142,6 +142,18 @@ pub fn export_dir(data_dir: &Path) -> Result<(Bundle, Vec<String>)> {
     for s in &storages {
         collect_dest_keys(std::slice::from_ref(&s.target), &mut key_files, &mut warnings, &mut seen_keys);
     }
+    for c in &connections {
+        if let crate::resources::ConnectionKind::Ssh { key_file: Some(path), .. } = &c.kind {
+            collect_key(path, &mut key_files, &mut warnings, &mut seen_keys);
+        }
+    }
+    for job in &jobs {
+        if let crate::Source::MySql { ssh: Some(l), .. } | crate::Source::SshFiles { ssh: Some(l), .. } = &job.source {
+            if let Some(path) = &l.key_file {
+                collect_key(path, &mut key_files, &mut warnings, &mut seen_keys);
+            }
+        }
+    }
     let bundle = Bundle {
         format: FORMAT.into(),
         version: VERSION,
@@ -199,14 +211,18 @@ fn reveal_string(v: &mut String) -> Result<()> {
 fn collect_dest_keys(dest: &[Destination], out: &mut Vec<ExportedKey>, warnings: &mut Vec<String>, seen: &mut HashSet<String>) {
     for d in dest {
         let Destination::Sftp { key_file: Some(path), .. } = d else { continue };
-        if path.is_empty() || !seen.insert(path.clone()) {
-            continue;
-        }
-        match read_key(path) {
-            Ok(Some(content_b64)) => out.push(ExportedKey { path: path.clone(), content_b64 }),
-            Ok(None) => warnings.push(format!("ключ «{path}» больше 256 КБ и не включён в файл")),
-            Err(e) => warnings.push(format!("ключ «{path}» не прочитан: {e}")),
-        }
+        collect_key(path, out, warnings, seen);
+    }
+}
+
+fn collect_key(path: &str, out: &mut Vec<ExportedKey>, warnings: &mut Vec<String>, seen: &mut HashSet<String>) {
+    if path.is_empty() || !seen.insert(path.to_string()) {
+        return;
+    }
+    match read_key(path) {
+        Ok(Some(content_b64)) => out.push(ExportedKey { path: path.to_string(), content_b64 }),
+        Ok(None) => warnings.push(format!("ключ «{path}» больше 256 КБ и не включён в файл")),
+        Err(e) => warnings.push(format!("ключ «{path}» не прочитан: {e}")),
     }
 }
 
@@ -487,6 +503,23 @@ fn rewrite_keys(bundle: &mut Bundle, map: &HashMap<String, String>) {
     }
     for s in &mut bundle.storages {
         rewrite_dests(std::slice::from_mut(&mut s.target), map);
+    }
+    let fix = |path: &mut String| {
+        if let Some(new) = map.get(path.as_str()) {
+            *path = new.clone();
+        }
+    };
+    for c in &mut bundle.connections {
+        if let crate::resources::ConnectionKind::Ssh { key_file: Some(path), .. } = &mut c.kind {
+            fix(path);
+        }
+    }
+    for job in &mut bundle.jobs {
+        if let crate::Source::MySql { ssh: Some(l), .. } | crate::Source::SshFiles { ssh: Some(l), .. } = &mut job.source {
+            if let Some(path) = &mut l.key_file {
+                fix(path);
+            }
+        }
     }
 }
 

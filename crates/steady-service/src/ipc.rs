@@ -75,6 +75,9 @@ enum Request {
     /// Базы сервера MS SQL или PostgreSQL для источника из формы задания (подключение или
     /// встроенные поля). Заодно проверяет подключение. Только администраторам: использует учётные данные.
     ListDatabases { source: steady_core::Source },
+    /// Источник «Файлы по SSH» из формы: вход на сервер и наличие каждого пути.
+    /// Возвращает отпечаток сервера, если он не закреплён. Только администраторам.
+    CheckSshPaths { source: steady_core::Source },
 
     // ---- хранилища и подключения ----
     ListStorages,
@@ -797,9 +800,41 @@ fn dispatch(engine: &Engine, raw: Value, admin: bool) -> Result<Value> {
                         TIMEOUT,
                     )?
                 }
-                _ => bail!("список баз есть только у источников MS SQL и PostgreSQL"),
+                steady_core::Source::MySql { ssh, db_host, db_port, db_user, db_password, .. } => {
+                    let pw = reveal_form_secret(db_password.as_deref())?;
+                    let login = ssh.as_ref().context("выберите подключение SSH")?;
+                    check_form_ssh(login)?;
+                    steady_core::source::mysql::list_databases(&steady_core::source::mysql::MySqlParams {
+                        ssh: login,
+                        db_host: db_host.as_deref(),
+                        db_port: *db_port,
+                        db_user,
+                        db_password: pw.as_deref(),
+                        databases: &[],
+                        timeout: TIMEOUT,
+                        attempts: 1,
+                    })?
+                }
+                _ => bail!("список баз есть только у источников MS SQL, PostgreSQL и MySQL"),
             };
             json!(names)
+        }
+        Request::CheckSshPaths { source } => {
+            let source = Resources::new(&engine.data_dir).resolve_source(&source)?;
+            let steady_core::Source::SshFiles { ssh: Some(login), paths, .. } = &source else {
+                bail!("выберите подключение SSH");
+            };
+            check_form_ssh(login)?;
+            let mut sess = steady_core::ssh::SshSession::open(login, false)?;
+            let mut items = Vec::new();
+            for p in paths.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let r: Result<_> = sess.sftp().and_then(|(rt, sftp)| Ok(rt.block_on(sftp.metadata(p))?));
+                items.push(match r {
+                    Ok(md) => json!({ "path": p, "ok": true, "dir": md.is_dir() }),
+                    Err(e) => json!({ "path": p, "ok": false, "error": format!("{e:#}") }),
+                });
+            }
+            json!({ "target": sess.label(), "host_key": sess.unpinned_host_key, "paths": items })
         }
         Request::ListVms => {
             let mut cmd = std::process::Command::new(steady_core::util::powershell_exe());
@@ -856,6 +891,14 @@ fn reveal_form_secret(v: Option<&str>) -> Result<Option<String>> {
     steady_core::secret::reveal_opt(v)
 }
 
+/// SSH из формы задания: маркер GUI без сохранённого значения не расшифровать.
+fn check_form_ssh(login: &steady_core::SshLogin) -> Result<()> {
+    if [&login.password, &login.key_passphrase].iter().any(|v| v.as_deref() == Some(steady_core::resources::STORED)) {
+        bail!("пароль SSH хранится в задании; выберите подключение из списка «Подключения»");
+    }
+    Ok(())
+}
+
 /// Подставляет сохранённые секреты вместо маркера "dpapi:stored" из GUI.
 fn merge_stored(
     mut s: steady_core::notify::NotifySettings,
@@ -883,6 +926,8 @@ fn source_kind(j: &Job) -> &'static str {
         steady_core::Source::HyperV { .. } => "hyper_v",
         steady_core::Source::Firebird { .. } => "firebird",
         steady_core::Source::PostgreSql { .. } => "postgresql",
+        steady_core::Source::MySql { .. } => "mysql",
+        steady_core::Source::SshFiles { .. } => "ssh_files",
     }
 }
 

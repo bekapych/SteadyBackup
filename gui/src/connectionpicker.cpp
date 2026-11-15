@@ -10,6 +10,15 @@
 
 static const char *kInline = "__inline__";
 
+// Подпись пункта «задано в задании».
+static QString inlineWho(const QJsonObject &in) {
+    const QJsonObject o = in.value("ssh").isObject() ? in.value("ssh").toObject() : in;
+    QString who = o.value("server").toString(o.value("host").toString());
+    const QString u = o.value("user").toString();
+    if (!u.isEmpty()) who += (who.isEmpty() ? "" : " · ") + u;
+    return who;
+}
+
 ConnectionPicker::ConnectionPicker(ServiceClient *client, const QString &type, const QString &noneText, QWidget *parent)
     : QWidget(parent), m_client(client), m_type(type), m_noneText(noneText) {
     m_combo = new SteadyCombo;
@@ -39,9 +48,7 @@ void ConnectionPicker::fill(const QString &select) {
     m_combo->setToolTip({});
     if (!m_noneText.isEmpty()) m_combo->addItem(m_noneText, QString());
     if (!m_inline.isEmpty()) {
-        QString who = m_inline.value("server").toString(m_inline.value("host").toString());
-        const QString u = m_inline.value("user").toString();
-        if (!u.isEmpty()) who += (who.isEmpty() ? "" : " · ") + u;
+        const QString who = inlineWho(m_inline);
         m_combo->addItem(tr("задано в задании: %1").arg(who.isEmpty() ? tr("без логина") : who), kInline);
     }
     // Сохранённую ссылку показываем сразу, не дожидаясь списка: иначе сохранение
@@ -64,9 +71,7 @@ void ConnectionPicker::reload(const QString &select) {
         m_combo->setToolTip({});
         if (!m_noneText.isEmpty()) m_combo->addItem(m_noneText, QString());
         if (!m_inline.isEmpty()) {
-            QString who = m_inline.value("server").toString(m_inline.value("host").toString());
-            const QString u = m_inline.value("user").toString();
-            if (!u.isEmpty()) who += (who.isEmpty() ? "" : " · ") + u;
+            const QString who = inlineWho(m_inline);
             m_combo->addItem(tr("задано в задании: %1").arg(who.isEmpty() ? tr("без логина") : who), kInline);
         }
         int found = 0;
@@ -83,6 +88,8 @@ void ConnectionPicker::reload(const QString &select) {
                     label += QStringLiteral("  (%1:%2)")
                                  .arg(o.value("host").toString(QStringLiteral("localhost")))
                                  .arg(o.value("port").toInt(5432));
+                if (m_type == "ssh")
+                    label += QStringLiteral("  (%1@%2)").arg(o.value("user").toString(), o.value("host").toString());
                 m_combo->addItem(label, o.value("id").toString());
                 ++found;
             }
@@ -108,8 +115,14 @@ void ConnectionPicker::setSource(const QJsonObject &s) {
     m_inline = {};
     // Встроенные поля читаем и при наличии connection: если подключение удалят,
     // данные старого задания останутся.
-    for (const char *k : {"server", "host", "user", "password"})
-        if (s.value(k).isString() && !s.value(k).toString().isEmpty()) m_inline[k] = s.value(k);
+    if (m_type == "ssh") {
+        // У источников по SSH вход задания — вложенный объект "ssh". Пока выбрано подключение,
+        // служба заполняет его сама, поэтому «заданным в задании» считаем его только без ссылки.
+        if (s.value("ssh").isObject() && m_savedConnection.isEmpty()) m_inline["ssh"] = s.value("ssh");
+    } else {
+        for (const char *k : {"server", "host", "user", "password"})
+            if (s.value(k).isString() && !s.value(k).toString().isEmpty()) m_inline[k] = s.value(k);
+    }
     m_userPicked = false;
     const QString select = !m_savedConnection.isEmpty() ? m_savedConnection
                                                        : (m_inline.isEmpty() ? QString() : QString(kInline));
@@ -128,6 +141,10 @@ void ConnectionPicker::apply(QJsonObject &s) const {
         // данные старого формата, которые служба использует, если подключение пропадёт.
         if (v == m_savedConnection) return;
         s["connection"] = v;
+        if (m_type == "ssh") {
+            s.remove("ssh");
+            return;
+        }
         s["user"] = QJsonValue(QJsonValue::Null);
         s["password"] = QJsonValue(QJsonValue::Null);
         if (m_type == "ms_sql") s["server"] = QString();
@@ -142,6 +159,11 @@ void ConnectionPicker::apply(QJsonObject &s) const {
     if (!m_ready) return;
     if (!m_savedConnection.isEmpty() && !m_userPicked) return;
     s["connection"] = QJsonValue(QJsonValue::Null);
+    if (m_type == "ssh") {
+        if (m_inline.isEmpty()) s.remove("ssh");
+        else s["ssh"] = m_inline.value("ssh");
+        return;
+    }
     if (m_inline.isEmpty()) {
         s["user"] = QJsonValue(QJsonValue::Null);
         s["password"] = QJsonValue(QJsonValue::Null);

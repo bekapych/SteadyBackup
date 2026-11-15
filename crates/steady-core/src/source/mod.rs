@@ -2,13 +2,15 @@ pub mod files;
 pub mod firebird;
 pub mod hyperv;
 pub mod mssql;
+pub mod mysql;
 pub mod onec;
 pub mod postgres;
+pub mod sshfiles;
 
 use crate::job::{BackupKind, Source};
 use crate::secret::reveal_opt;
 use crate::state::JobState;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Результат подготовки источника в staging-каталоге.
@@ -146,6 +148,31 @@ pub fn prepare(
                 staging,
             )
         }
+        Source::MySql { ssh, db_host, db_port, db_user, db_password, databases, .. } => mysql::prepare(
+            &mysql::MySqlParams {
+                ssh: ssh.as_ref().context("MySQL: не задано подключение SSH")?,
+                db_host: db_host.as_deref(),
+                db_port: *db_port,
+                db_user,
+                db_password: reveal_opt(db_password.as_deref())?.as_deref(),
+                databases,
+                timeout,
+                attempts,
+            },
+            staging,
+        ),
+        Source::SshFiles { ssh, paths, include, exclude, kind, full_every, .. } => sshfiles::prepare(
+            &sshfiles::SshFilesParams {
+                ssh: ssh.as_ref().context("не задано подключение SSH")?,
+                paths,
+                include,
+                exclude,
+                requested: *kind,
+                full_every: *full_every,
+            },
+            state,
+            staging,
+        ),
         Source::HyperV { vm_name, kind, full_every, consistency } => hyperv::prepare(
             &hyperv::HyperVParams { vm_name, kind: *kind, full_every: *full_every, consistency: *consistency, timeout },
             state,

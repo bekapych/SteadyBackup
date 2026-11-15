@@ -69,6 +69,28 @@ pub enum ConnectionKind {
         #[serde(default)]
         password: Option<String>,
     },
+    /// Сервер SSH (источники «MySQL по SSH» и «Файлы по SSH»).
+    Ssh {
+        host: String,
+        #[serde(default = "ssh_port")]
+        port: u16,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+        /// Закрытый ключ; пробуется раньше пароля.
+        #[serde(default)]
+        key_file: Option<String>,
+        #[serde(default)]
+        key_passphrase: Option<String>,
+        /// Отпечаток ключа сервера "SHA256:...".
+        #[serde(default)]
+        host_key: Option<String>,
+    },
+}
+
+fn ssh_port() -> u16 {
+    22
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,21 +109,27 @@ impl Connection {
             ConnectionKind::WebDav { .. } => "web_dav",
             ConnectionKind::Firebird { .. } => "firebird",
             ConnectionKind::PostgreSql { .. } => "postgresql",
+            ConnectionKind::Ssh { .. } => "ssh",
         }
     }
 
-    fn password_mut(&mut self) -> &mut Option<String> {
+    /// Все секреты подключения: пароль и, у SSH, пароль ключа.
+    fn secrets_mut(&mut self) -> Vec<&mut Option<String>> {
         match &mut self.kind {
+            ConnectionKind::Ssh { password, key_passphrase, .. } => vec![password, key_passphrase],
             ConnectionKind::MsSql { password, .. }
             | ConnectionKind::OneC { password, .. }
             | ConnectionKind::WebDav { password, .. }
             | ConnectionKind::Firebird { password, .. }
-            | ConnectionKind::PostgreSql { password, .. } => password,
+            | ConnectionKind::PostgreSql { password, .. } => vec![password],
         }
     }
 
     pub fn reveal_secrets(&mut self) -> Result<()> {
-        crate::job::reveal_opt(self.password_mut())
+        for s in self.secrets_mut() {
+            crate::job::reveal_opt(s)?;
+        }
+        Ok(())
     }
 
     pub fn user_password(&self) -> (Option<&str>, Option<&str>) {
@@ -110,7 +138,26 @@ impl Connection {
             | ConnectionKind::OneC { user, password }
             | ConnectionKind::WebDav { user, password }
             | ConnectionKind::Firebird { user, password }
-            | ConnectionKind::PostgreSql { user, password, .. } => (user.as_deref(), password.as_deref()),
+            | ConnectionKind::PostgreSql { user, password, .. }
+            | ConnectionKind::Ssh { user, password, .. } => (user.as_deref(), password.as_deref()),
+        }
+    }
+
+    /// Параметры входа SSH (секреты как хранятся: `dpapi:...`).
+    pub fn ssh_login(&self) -> Option<crate::job::SshLogin> {
+        match &self.kind {
+            ConnectionKind::Ssh { host, port, user, password, key_file, key_passphrase, host_key } => {
+                Some(crate::job::SshLogin {
+                    host: host.clone(),
+                    port: *port,
+                    user: user.clone().unwrap_or_default(),
+                    password: password.clone(),
+                    key_file: key_file.clone(),
+                    key_passphrase: key_passphrase.clone(),
+                    host_key: host_key.clone(),
+                })
+            }
+            _ => None,
         }
     }
 }
@@ -254,10 +301,14 @@ impl Resources {
         if c.id.is_empty() {
             c.id = self.unique_id("connections", &slug(&c.name));
         }
-        if c.password_mut().as_deref() == Some(STORED) {
-            *c.password_mut() = self.connection(&c.id).ok().and_then(|mut o| o.password_mut().take());
+        let mut old = self.connection(&c.id).ok();
+        let mut old_secrets = old.as_mut().map(|o| o.secrets_mut()).unwrap_or_default();
+        for (i, s) in c.secrets_mut().into_iter().enumerate() {
+            if s.as_deref() == Some(STORED) {
+                *s = old_secrets.get_mut(i).and_then(|o| o.take());
+            }
+            protect_opt(s)?;
         }
-        protect_opt(c.password_mut())?;
         self.write("connections", &c.id, &c)?;
         Ok(c)
     }
@@ -343,6 +394,10 @@ impl Resources {
                 *user = u;
                 *password = p;
             }
+            Source::MySql { connection: Some(id), ssh, .. } | Source::SshFiles { connection: Some(id), ssh, .. } => {
+                let c = self.connection(id)?;
+                *ssh = Some(c.ssh_login().with_context(|| format!("подключение «{id}» не является подключением SSH"))?);
+            }
             _ => {}
         }
         Ok(s)
@@ -390,8 +445,8 @@ impl Resources {
 
     pub fn connections_masked(&self) -> Result<Vec<Connection>> {
         Ok(self.connections()?.into_iter().map(|mut c| {
-            if c.password_mut().as_deref().is_some_and(|p| !p.is_empty()) {
-                *c.password_mut() = Some(STORED.into());
+            for s in c.secrets_mut() {
+                mask(s);
             }
             c
         }).collect())
@@ -404,7 +459,9 @@ pub fn source_connection(s: &Source) -> Option<&str> {
         | Source::OneC { connection, .. }
         | Source::MsSql { connection, .. }
         | Source::Firebird { connection, .. }
-        | Source::PostgreSql { connection, .. } => {
+        | Source::PostgreSql { connection, .. }
+        | Source::MySql { connection, .. }
+        | Source::SshFiles { connection, .. } => {
             connection.as_deref()
         }
         Source::HyperV { .. } => None,
@@ -589,6 +646,32 @@ mod tests {
         let mut loaded = res.connections().unwrap().remove(0);
         loaded.reveal_secrets().unwrap();
         assert_eq!(loaded.user_password(), (Some("SYSDBA"), Some("masterkey")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Оба секрета SSH маскируются для GUI и сохраняются по маркеру; источник получает вход из подключения.
+    #[cfg(windows)]
+    #[test]
+    fn ssh_connection_keeps_both_secrets() {
+        let d = std::env::temp_dir().join(format!("steady-res-ssh-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        let res = Resources::new(&d);
+        let c: Connection = serde_json::from_str(
+            r#"{"id":"web","name":"Сайт","type":"ssh","host":"example.ru","user":"deploy","password":"pw","key_passphrase":"kp"}"#,
+        )
+        .unwrap();
+        res.save_connection(c).unwrap();
+        let mut masked = res.connections_masked().unwrap().remove(0);
+        let ConnectionKind::Ssh { password, key_passphrase, port, .. } = &masked.kind else { panic!("не SSH") };
+        assert_eq!((password.as_deref(), key_passphrase.as_deref(), *port), (Some(STORED), Some(STORED), 22));
+        masked.name = "Сайт 2".into();
+        res.save_connection(masked).unwrap();
+
+        let job: Source = serde_json::from_str(r#"{"type":"ssh_files","connection":"web","paths":["/var/www"]}"#).unwrap();
+        let Source::SshFiles { ssh: Some(mut login), .. } = res.resolve_source(&job).unwrap() else { panic!("нет входа") };
+        login.reveal_secrets().unwrap();
+        assert_eq!((login.host.as_str(), login.user.as_str()), ("example.ru", "deploy"));
+        assert_eq!((login.password.as_deref(), login.key_passphrase.as_deref()), (Some("pw"), Some("kp")));
         let _ = std::fs::remove_dir_all(&d);
     }
 

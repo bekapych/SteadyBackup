@@ -80,7 +80,9 @@ impl Source {
     /// Каждую базу упаковывать в отдельный архив.
     pub fn separate_archives(&self) -> bool {
         match self {
-            Source::MsSql { separate_archives, .. } | Source::PostgreSql { separate_archives, .. } => *separate_archives,
+            Source::MsSql { separate_archives, .. }
+            | Source::PostgreSql { separate_archives, .. }
+            | Source::MySql { separate_archives, .. } => *separate_archives,
             _ => false,
         }
     }
@@ -88,7 +90,7 @@ impl Source {
     /// Источник сам повторяет каждую базу (`Job::step_attempts`): общий повтор подготовки
     /// для него не нужен, иначе одна неудачная база заново выгружала бы все.
     pub fn retries_per_item(&self) -> bool {
-        matches!(self, Source::MsSql { .. } | Source::PostgreSql { .. })
+        matches!(self, Source::MsSql { .. } | Source::PostgreSql { .. } | Source::MySql { .. })
     }
 
     /// Значение по умолчанию с запасом на большие объёмы: зависание должно прерываться,
@@ -97,11 +99,11 @@ impl Source {
         let hours = match self {
             // Выгрузка .dt даже больших файловых баз занимает минуты–десятки минут.
             Source::OneC { .. } => 3,
-            Source::MsSql { .. } | Source::Firebird { .. } | Source::PostgreSql { .. } => 6,
+            Source::MsSql { .. } | Source::Firebird { .. } | Source::PostgreSql { .. } | Source::MySql { .. } => 6,
             // Экспорт ВМ на сотни гигабайт.
             Source::HyperV { .. } => 12,
             // Для файлов внешняя программа — только 7-Zip.
-            Source::Files { .. } => 12,
+            Source::Files { .. } | Source::SshFiles { .. } => 12,
         };
         std::time::Duration::from_secs(hours * 3600)
     }
@@ -124,6 +126,17 @@ impl Job {
             | Source::MsSql { password, .. }
             | Source::Firebird { password, .. }
             | Source::PostgreSql { password, .. } => p(password)?,
+            Source::MySql { ssh, db_password, .. } => {
+                p(db_password)?;
+                if let Some(s) = ssh {
+                    s.protect_secrets()?;
+                }
+            }
+            Source::SshFiles { ssh, .. } => {
+                if let Some(s) = ssh {
+                    s.protect_secrets()?;
+                }
+            }
             Source::HyperV { .. } => {}
         }
         for d in &mut self.destinations {
@@ -141,6 +154,17 @@ impl Job {
             | Source::MsSql { password, .. }
             | Source::Firebird { password, .. }
             | Source::PostgreSql { password, .. } => reveal_opt(password)?,
+            Source::MySql { ssh, db_password, .. } => {
+                reveal_opt(db_password)?;
+                if let Some(s) = ssh {
+                    s.reveal_secrets()?;
+                }
+            }
+            Source::SshFiles { ssh, .. } => {
+                if let Some(s) = ssh {
+                    s.reveal_secrets()?;
+                }
+            }
             Source::HyperV { .. } => {}
         }
         for d in &mut self.destinations {
@@ -378,6 +402,91 @@ pub enum Source {
         #[serde(default)]
         separate_archives: bool,
     },
+    /// Базы MySQL/MariaDB на сервере Linux: `mysqldump` запускается на сервере по SSH,
+    /// дамп `<база>.sql` передаётся по тому же соединению (со сжатием SSH).
+    #[serde(rename = "mysql")]
+    MySql {
+        /// Подключение SSH из раздела «Подключения».
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection: Option<String>,
+        /// Параметры SSH. Заполняются из `connection`; заданные прямо в задании используются без него.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh: Option<SshLogin>,
+        /// Сервер MySQL, как его видит сервер SSH. Пусто — `localhost`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        db_host: Option<String>,
+        /// Порт MySQL. Нет — по умолчанию клиента (3306).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        db_port: Option<u16>,
+        /// Пользователь MySQL.
+        #[serde(default)]
+        db_user: String,
+        /// Пароль MySQL (DPAPI). На сервер передаётся во временном файле параметров с правами 0600,
+        /// не в командной строке.
+        #[serde(default)]
+        db_password: Option<String>,
+        /// Базы. Пусто — все базы, видимые пользователю (без information_schema,
+        /// performance_schema, mysql, sys).
+        #[serde(default)]
+        databases: Vec<String>,
+        /// Каждую базу — в отдельный архив (`<набор>.<база>.7z`). Нет — все базы в одном архиве.
+        #[serde(default)]
+        separate_archives: bool,
+    },
+    /// Файлы с сервера по SSH (SFTP): каталоги сайта и т. п. Полная, инкрементная или
+    /// дифференциальная копия — как у источника `files` (по размеру и времени изменения).
+    SshFiles {
+        /// Подключение SSH из раздела «Подключения».
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection: Option<String>,
+        /// Параметры SSH. Заполняются из `connection`; заданные прямо в задании используются без него.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh: Option<SshLogin>,
+        /// Каталоги или файлы на сервере: `/var/www/site`. Относительный путь — от домашнего каталога.
+        paths: Vec<String>,
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+        #[serde(default = "full_kind")]
+        kind: BackupKind,
+        /// Полная копия каждые N копий (0 — никогда автоматически).
+        #[serde(default)]
+        full_every: u32,
+    },
+}
+
+/// Вход на сервер SSH. Общий для источников «MySQL по SSH» и «Файлы по SSH».
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SshLogin {
+    pub host: String,
+    #[serde(default = "ssh_port")]
+    pub port: u16,
+    pub user: String,
+    /// DPAPI.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Закрытый ключ (OpenSSH/PEM). Пробуется раньше пароля.
+    #[serde(default)]
+    pub key_file: Option<String>,
+    /// Пароль к ключу (DPAPI).
+    #[serde(default)]
+    pub key_passphrase: Option<String>,
+    /// Отпечаток ключа сервера "SHA256:...". Не задан — принимается любой, с предупреждением.
+    #[serde(default)]
+    pub host_key: Option<String>,
+}
+
+impl SshLogin {
+    pub fn protect_secrets(&mut self) -> anyhow::Result<()> {
+        protect_opt(&mut self.password)?;
+        protect_opt(&mut self.key_passphrase)
+    }
+
+    pub fn reveal_secrets(&mut self) -> anyhow::Result<()> {
+        reveal_opt(&mut self.password)?;
+        reveal_opt(&mut self.key_passphrase)
+    }
 }
 
 fn full_kind() -> BackupKind {

@@ -76,4 +76,9 @@ private:
     QLabel *m_serverLabel;
     class QSpinBox *m_port;
     QLabel *m_portLabel;
+    // SSH: ключ, пароль ключа, отпечаток сервера.
+    QLineEdit *m_keyFile, *m_hostKey;
+    PasswordEdit *m_keyPass;
+    QWidget *m_keyRow;
+    QLabel *m_keyLabel, *m_keyPassLabel, *m_hostKeyLabel;
 };

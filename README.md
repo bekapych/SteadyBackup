@@ -1,7 +1,7 @@
 # SteadyBackup
 
 Резервное копирование для Windows: файлы, файловые базы 1С, MS SQL, PostgreSQL, Firebird,
-виртуальные машины Hyper-V → 7-Zip → локальная папка, SMB, SFTP, WebDAV, Google Drive.
+виртуальные машины Hyper-V, сайты на серверах Linux (MySQL/MariaDB и файлы по SSH) → 7-Zip → локальная папка, SMB, SFTP, WebDAV, Google Drive.
 Расписания, группы заданий, ротация копий, повторы при ошибках, уведомления по e-mail и в Telegram.
 
 Служба Windows (`steady.exe`, Rust) выполняет задания; окно настройки (`steady-gui.exe`, Qt 6)

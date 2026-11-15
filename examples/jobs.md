@@ -35,7 +35,7 @@ IPC-команды: `status`, `list_jobs`, `get_job {job_id}`, `save_job {job}`,
 того же пользователя получает права администратора, а задания этого пользователя загружаются;
 служба Windows так не делает.
 
-`list_databases {source}` — базы сервера для источника `ms_sql` или `postgresql` (как в задании: `connection`
+`list_databases {source}` — базы сервера для источника `ms_sql`, `postgresql` или `mysql` (как в задании: `connection`
 или встроенные поля); заодно проверяет подключение. Только администраторам, тайм-аут 60 с.
 
 `work_dir` — каталог staging и архива. Пусто — `%ProgramData%\SteadyBackup\work`. Свой путь должен быть
@@ -86,7 +86,7 @@ IPC: `list_groups` (состав, расписание, `next_run`), `save_group
 "restarts": 2, "restart_delay_minutes": 10, "attempts": 3
 ```
 
-`"timeout_minutes"`: предельное время одного запуска внешней программы (1С, sqlcmd, PowerShell для Hyper-V, упаковка 7-Zip), в минутах. Нет или `0` — значение по умолчанию для типа источника: 1С — 3 часа, MS SQL, Firebird и PostgreSQL — 6 часов, файлы и Hyper-V — 12 часов. По истечении процесс и его потомки завершаются, задание завершается ошибкой с указанием этапа. В GUI — поле «Прервать, если длится дольше» на странице расписания.
+`"timeout_minutes"`: предельное время одного запуска внешней программы (1С, sqlcmd, PowerShell для Hyper-V, упаковка 7-Zip), в минутах. Нет или `0` — значение по умолчанию для типа источника: 1С — 3 часа, MS SQL, Firebird, PostgreSQL и MySQL (каждый `mysqldump`) — 6 часов, файлы (в т. ч. по SSH) и Hyper-V — 12 часов. По истечении процесс и его потомки завершаются, задание завершается ошибкой с указанием этапа. В GUI — поле «Прервать, если длится дольше» на странице расписания.
 
 ## Файловая база 1С (выгрузка .dt)
 ```json
@@ -195,6 +195,60 @@ IPC: `list_groups` (состав, расписание, `next_run`), `save_group
   `localhost`, `5432`, `postgres`. Тайм-аут по умолчанию — 6 часов на каждый запуск утилиты.
 
 `retention.keep_full` удаляет только лишние полные цепочки. У задания с `kind` `differential` или `log` полных копий под своим именем нет, поэтому одно это поле ничего не удаляет. Для них (и для хвоста старше сохранённой полной) — `keep_days` (удалять наборы старше стольких дней) и `keep_sets` (оставить не больше стольких последних наборов). `0` — правило выключено. Цепочку, которую удерживает `keep_full`, срок и число не трогают. Старый JSON без этих полей читается как прежде.
+
+## Сайт на сервере Linux: MySQL и файлы по SSH
+
+Сервер SSH задаётся подключением типа `ssh` (раздел «Подключения»):
+
+```json
+{ "id": "site-ru", "name": "site.ru", "type": "ssh", "host": "site.ru", "port": 22, "user": "deploy",
+  "password": "dpapi:...", "key_file": null, "key_passphrase": null, "host_key": "SHA256:..." }
+```
+
+`key_file` — закрытый ключ OpenSSH/PEM (пробуется раньше пароля). `host_key` — отпечаток сервера; не задан —
+принимается любой, а в итоге запуска появляется предупреждение с отпечатком. Вместо `connection` можно
+указать в источнике объект `"ssh": { host, port, user, password, key_file, key_passphrase, host_key }`.
+
+**Базы MySQL / MariaDB** (`mysqldump` или `mariadb-dump` на сервере; дамп `<база>.sql` идёт по SSH со сжатием):
+
+```json
+{
+  "id": "6f1c0000-0000-0000-0000-000000000006",
+  "name": "site.ru БД",
+  "source": { "type": "mysql", "connection": "site-ru", "db_user": "site", "db_password": "dpapi:...",
+              "databases": ["site"], "separate_archives": false },
+  "destinations": [ { "type": "storage", "storage": "nas", "folder": "site.ru" } ],
+  "retention": { "keep_full": 14 },
+  "schedule": { "type": "daily", "times": ["03:00:00"] }
+}
+```
+
+* `db_host` (пусто — `localhost`, как его видит сервер SSH), `db_port` (нет — 3306; с `localhost` включает TCP).
+* `databases` пусто — все базы, видимые пользователю, кроме `information_schema`, `performance_schema`,
+  `mysql`, `sys`. `separate_archives` — как у MS SQL.
+* Ключи `mysqldump`: `--single-transaction --quick --routines --triggers --hex-blob --no-tablespaces
+  --databases`. Восстановление: `mysql -u … -p < база.sql` (в дампе есть `CREATE DATABASE`/`USE`).
+* Пароль БД передаётся команде через stdin и на время дампа лежит на сервере во временном файле
+  с правами 0600 (`--defaults-extra-file`); в командной строке сервера его нет.
+* Дамп без последней строки `-- Dump completed` считается оборванным. Каждая база повторяется
+  `attempts` раз через новое соединение; несохранённые базы — ошибка запуска, остальные отправляются.
+
+**Файлы по SSH** (SFTP; полная, инкрементная, дифференциальная — как у `files`):
+
+```json
+"source": { "type": "ssh_files", "connection": "site-ru", "paths": ["/var/www/site.ru"],
+            "exclude": ["cache/**", "*.log"], "kind": "incremental", "full_every": 7 }
+```
+
+Относительный путь — от домашнего каталога пользователя SSH. Символические ссылки, сокеты и пустые
+каталоги не копируются. Обрыв соединения — ошибка подготовки (повтор по `attempts`); ошибка чтения
+отдельного файла — предупреждение, файл попадёт в следующую копию.
+
+Полная копия сайта — два задания (базы и файлы) в одной группе с общим расписанием.
+
+IPC: `list_databases {source}` работает и для `mysql` (нужен `db_user`); `check_ssh_paths {source}` —
+вход на сервер и наличие каждого пути источника `ssh_files` (`{target, host_key, paths:[{path, ok, dir|error}]}`),
+только администраторам.
 
 ## Файлы: локальные, сетевые, WebDAV (инкрементная, полная каждые 7 копий)
 ```json

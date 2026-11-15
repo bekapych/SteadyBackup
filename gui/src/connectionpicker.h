@@ -11,7 +11,7 @@ class ServiceClient;
 class ConnectionPicker : public QWidget {
     Q_OBJECT
 public:
-    // type: "ms_sql" | "one_c" | "web_dav"; noneText — подпись пункта «без подключения» (пусто — пункта нет).
+    // type: "ms_sql" | "one_c" | "web_dav" | "firebird" | "postgresql" | "ssh"; noneText — подпись пункта «без подключения» (пусто — пункта нет).
     ConnectionPicker(ServiceClient *client, const QString &type, const QString &noneText, QWidget *parent = nullptr);
     void setSource(const QJsonObject &source);
     // Записывает в источник connection (и сохраняет встроенные поля, если выбран «старый» вариант).

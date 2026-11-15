@@ -9,6 +9,8 @@
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QDialogButtonBox>
+#include <QDir>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -49,6 +51,7 @@ static QString connectionTypeTitle(const QString &t) {
     if (t == "web_dav") return QObject::tr("WebDAV (источник)");
     if (t == "firebird") return QObject::tr("Firebird");
     if (t == "postgresql") return QObject::tr("PostgreSQL");
+    if (t == "ssh") return QObject::tr("SSH");
     return t;
 }
 
@@ -154,7 +157,8 @@ ResourcesDialog::ResourcesDialog(ServiceClient *client, QWidget *parent, int tab
     ch->addWidget(m_connections, 1);
     ch->addLayout(cb);
     auto *cv = new QVBoxLayout(cp);
-    auto *cHint = new QLabel(tr("Учётные данные источников: SQL Server, пользователь 1С, WebDAV, Firebird. "
+    auto *cHint = new QLabel(tr("Учётные данные источников: SQL Server, пользователь 1С, WebDAV, Firebird, PostgreSQL, "
+                                "SSH (сайты: MySQL и файлы по SSH). "
                                 "Пароль меняется в одном месте для всех заданий."));
     theme::markHint(cHint);
     cHint->setWordWrap(true);
@@ -205,6 +209,8 @@ void ResourcesDialog::refresh() {
                           .arg(c.value("host").toString(QStringLiteral("localhost")))
                           .arg(c.value("port").toInt(5432))
                           .arg(who.isEmpty() ? QStringLiteral("postgres") : who);
+            if (c.value("type") == "ssh")
+                who = QStringLiteral("%1@%2:%3").arg(who, c.value("host").toString()).arg(c.value("port").toInt(22));
             const QStringList cells{c.value("name").toString(), connectionTypeTitle(c.value("type").toString()), who,
                                     used.isEmpty() ? tr("—") : used.join(", ")};
             for (int k = 0; k < cells.size(); ++k) m_connections->setItem(i, k, new QTableWidgetItem(cells[k]));
@@ -412,26 +418,53 @@ ConnectionDialog::ConnectionDialog(const QJsonObject &c, QWidget *parent) : QDia
     m_type->addItem(tr("WebDAV (источник файлов)"), "web_dav");
     m_type->addItem(tr("Firebird (SYSDBA)"), "firebird");
     m_type->addItem(tr("PostgreSQL"), "postgresql");
+    m_type->addItem(tr("SSH (сервер сайта)"), "ssh");
     const QString type = c.value("type").toString("ms_sql");
     m_type->setCurrentIndex(qMax(0, m_type->findData(type)));
-    // У PostgreSQL сервер хранится в поле host, у SQL Server — в server.
-    m_server = new QLineEdit(c.value(type == "postgresql" ? "host" : "server").toString());
+    // У PostgreSQL и SSH сервер хранится в поле host, у SQL Server — в server.
+    m_server = new QLineEdit(c.value(type == "ms_sql" ? "server" : "host").toString());
     m_serverLabel = new QLabel(tr("Сервер:"));
     m_port = new QSpinBox;
     m_port->setRange(1, 65535);
-    m_port->setValue(c.value("port").toInt(5432));
+    m_port->setValue(c.value("port").toInt(type == "ssh" ? 22 : 5432));
     m_portLabel = new QLabel(tr("Порт:"));
     m_user = new QLineEdit(c.value("user").toString());
     m_password = new PasswordEdit;
     m_password->setStored(c.value("password").toString());
+    m_keyFile = new QLineEdit(c.value("key_file").toString());
+    m_keyFile->setPlaceholderText(tr("необязательно: закрытый ключ OpenSSH"));
+    auto *browse = new QPushButton(tr("Обзор…"));
+    connect(browse, &QPushButton::clicked, this, [this] {
+        const QString p = QFileDialog::getOpenFileName(this, tr("Закрытый ключ SSH"), m_keyFile->text());
+        if (!p.isEmpty()) m_keyFile->setText(QDir::toNativeSeparators(p));
+    });
+    m_keyRow = new QWidget;
+    auto *kl = new QHBoxLayout(m_keyRow);
+    kl->setContentsMargins(0, 0, 0, 0);
+    kl->addWidget(m_keyFile, 1);
+    kl->addWidget(browse);
+    m_keyLabel = new QLabel(tr("Ключ:"));
+    m_keyPass = new PasswordEdit;
+    m_keyPass->setStored(c.value("key_passphrase").toString());
+    m_keyPassLabel = new QLabel(tr("Пароль ключа:"));
+    m_hostKey = new QLineEdit(c.value("host_key").toString());
+    m_hostKey->setPlaceholderText(tr("SHA256:… — заполнится при проверке в задании"));
+    m_hostKeyLabel = new QLabel(tr("Отпечаток сервера:"));
     auto update = [this] {
         const bool sql = m_type->currentData() == "ms_sql";
         const bool pg = m_type->currentData() == "postgresql";
-        m_server->setVisible(sql || pg);
-        m_serverLabel->setVisible(sql || pg);
-        m_port->setVisible(pg);
-        m_portLabel->setVisible(pg);
-        m_server->setPlaceholderText(pg ? QStringLiteral("localhost") : QStringLiteral(". или SQL01\\INSTANCE"));
+        const bool ssh = m_type->currentData() == "ssh";
+        m_server->setVisible(sql || pg || ssh);
+        m_serverLabel->setVisible(sql || pg || ssh);
+        m_port->setVisible(pg || ssh);
+        m_portLabel->setVisible(pg || ssh);
+        // Порт по умолчанию следует за типом; заданный вручную не трогаем.
+        if (m_port->value() == 22 || m_port->value() == 5432) m_port->setValue(ssh ? 22 : 5432);
+        for (QWidget *w : std::initializer_list<QWidget *>{m_keyRow, m_keyLabel, m_keyPass, m_keyPassLabel, m_hostKey,
+                                                            m_hostKeyLabel})
+            w->setVisible(ssh);
+        m_server->setPlaceholderText(sql ? QStringLiteral(". или SQL01\\INSTANCE")
+                                         : (ssh ? QStringLiteral("site.example.ru") : QStringLiteral("localhost")));
         m_user->setPlaceholderText(sql ? tr("пусто — проверка подлинности Windows")
                                        : (pg ? QStringLiteral("postgres") : QString()));
     };
@@ -452,6 +485,9 @@ ConnectionDialog::ConnectionDialog(const QJsonObject &c, QWidget *parent) : QDia
     f->addRow(m_portLabel, m_port);
     f->addRow(tr("Пользователь:"), m_user);
     f->addRow(tr("Пароль:"), m_password);
+    f->addRow(m_keyLabel, m_keyRow);
+    f->addRow(m_keyPassLabel, m_keyPass);
+    f->addRow(m_hostKeyLabel, m_hostKey);
     auto *v = new QVBoxLayout(this);
     v->addLayout(f);
     v->addWidget(buttons);
@@ -469,12 +505,21 @@ QJsonObject ConnectionDialog::value() const {
         c["host"] = util::optString(m_server->text());
         c["port"] = m_port->value();
     }
+    if (m_type->currentData() == "ssh") {
+        c["host"] = m_server->text().trimmed();
+        c["port"] = m_port->value();
+        c["key_file"] = util::optString(m_keyFile->text());
+        c["key_passphrase"] = m_keyPass->value();
+        c["host_key"] = util::optString(m_hostKey->text());
+    }
     return c;
 }
 
 void ConnectionDialog::accept() {
     if (m_name->text().trimmed().isEmpty()) return (void)QMessageBox::warning(this, windowTitle(), tr("Укажите название."));
-    if (m_type->currentData() == "ms_sql" && m_server->text().trimmed().isEmpty())
+    if ((m_type->currentData() == "ms_sql" || m_type->currentData() == "ssh") && m_server->text().trimmed().isEmpty())
         return (void)QMessageBox::warning(this, windowTitle(), tr("Укажите сервер."));
+    if (m_type->currentData() == "ssh" && m_user->text().trimmed().isEmpty())
+        return (void)QMessageBox::warning(this, windowTitle(), tr("Укажите пользователя SSH."));
     QDialog::accept();
 }

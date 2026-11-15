@@ -49,6 +49,8 @@ private:
     // Строка кнопок «Проверить и обновить», «Добавить вручную…», «Отметить все/снять».
     QWidget *dbButtons(QListWidget *list, const QString &type);
     QComboBox *makeArchiveMode();
+    // «Файлы по SSH»: вход на сервер и наличие каталогов.
+    void checkSshPaths();
 
     ServiceClient *m_client;
     QJsonObject m_original;
@@ -87,6 +89,17 @@ private:
     QLabel *m_pgStatus;
     QLineEdit *m_pgDump;
     QCheckBox *m_pgGlobals, *m_pgVerify;
+    ConnectionPicker *m_myConn, *m_sshConn; // подключения SSH
+    QLineEdit *m_myHost, *m_myUser;
+    QSpinBox *m_myPort; // 0 — порт по умолчанию
+    PasswordEdit *m_myPassword;
+    QListWidget *m_myDatabases;
+    QComboBox *m_myArchives;
+    QLabel *m_myStatus, *m_sshStatus;
+    QPlainTextEdit *m_sshPaths;
+    QLineEdit *m_sshInclude, *m_sshExclude;
+    QComboBox *m_sshKind;
+    QSpinBox *m_sshFullEvery;
     QComboBox *m_vmName;
     QComboBox *m_vmKind;
     QSpinBox *m_vmFullEvery;

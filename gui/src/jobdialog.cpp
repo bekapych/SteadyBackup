@@ -80,6 +80,8 @@ QWidget *JobDialog::buildSourcePage() {
     m_srcType->addItem(tr("База MS SQL Server"), "ms_sql");
     m_srcType->addItem(tr("База Firebird"), "firebird");
     m_srcType->addItem(tr("Базы PostgreSQL"), "postgresql");
+    m_srcType->addItem(tr("Базы MySQL / MariaDB по SSH (сайт)"), "mysql");
+    m_srcType->addItem(tr("Файлы по SSH (сайт)"), "ssh_files");
     m_srcType->addItem(tr("Виртуальная машина Hyper-V"), "hyper_v");
     m_srcPages = new QStackedWidget;
 
@@ -285,6 +287,99 @@ QWidget *JobDialog::buildSourcePage() {
                                    "через окружение и не виден в командной строке. Роли сохраняются только под "
                                    "суперпользователем. Если одна база не сохранилась, остальные всё равно "
                                    "отправляются, а задание завершается ошибкой."));
+        hint->setWordWrap(true);
+        theme::markHint(hint);
+        f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+    { // MySQL по SSH
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        m_myConn = new ConnectionPicker(m_client, "ssh", tr("не выбрано"));
+        connect(m_myConn, &ConnectionPicker::changed, this, [this] { loadDatabases("mysql", true); });
+        m_myHost = new QLineEdit;
+        m_myHost->setPlaceholderText(tr("localhost (как его видит сервер SSH)"));
+        m_myPort = new QSpinBox;
+        m_myPort->setRange(0, 65535);
+        m_myPort->setSpecialValueText(tr("по умолчанию (3306)"));
+        m_myUser = new QLineEdit;
+        m_myPassword = new PasswordEdit;
+        m_myDatabases = new QListWidget;
+        m_myDatabases->setMinimumHeight(80);
+        m_myDatabases->setMaximumHeight(160);
+        m_myDatabases->setToolTip(tr("Отметьте нужные базы. Ничего не отмечено — копируются все базы, доступные "
+                                     "пользователю (без information_schema, performance_schema, mysql, sys)."));
+        QWidget *myButtons = dbButtons(m_myDatabases, "mysql");
+        m_myArchives = makeArchiveMode();
+        m_myStatus = new QLabel;
+        m_myStatus->setWordWrap(true);
+        auto *db = new QWidget;
+        auto *dl = new QHBoxLayout(db);
+        dl->setContentsMargins(0, 0, 0, 0);
+        dl->addWidget(m_myHost, 1);
+        dl->addWidget(new QLabel(tr("порт:")));
+        dl->addWidget(m_myPort);
+        f->addRow(tr("Сервер SSH:"), m_myConn);
+        f->addRow(tr("Сервер MySQL:"), db);
+        f->addRow(tr("Пользователь БД:"), m_myUser);
+        f->addRow(tr("Пароль БД:"), m_myPassword);
+        f->addRow(tr("Базы:"), m_myDatabases);
+        f->addRow(QString(), myButtons);
+        f->addRow(QString(), m_myStatus);
+        f->addRow(tr("Архивы:"), m_myArchives);
+        auto *hint = new QLabel(tr("mysqldump (или mariadb-dump) запускается на сервере по SSH, дамп .sql передаётся "
+                                   "по тому же соединению со сжатием. Копия согласованная (--single-transaction), сайт "
+                                   "не останавливается. Пароль БД не попадает в командную строку сервера. Если одна база "
+                                   "не сохранилась, остальные всё равно отправляются, а задание завершается ошибкой. "
+                                   "Восстановление: mysql < база.sql."));
+        hint->setWordWrap(true);
+        theme::markHint(hint);
+        f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+    { // Файлы по SSH
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        m_sshConn = new ConnectionPicker(m_client, "ssh", tr("не выбрано"));
+        m_sshPaths = new QPlainTextEdit;
+        m_sshPaths->setMinimumHeight(64);
+        m_sshPaths->setMaximumHeight(140);
+        m_sshPaths->setPlaceholderText(tr("По одному каталогу на строку:\n/var/www/site.ru\npublic_html"));
+        auto *check = new QPushButton(tr("Проверить"));
+        m_sshStatus = new QLabel;
+        m_sshStatus->setWordWrap(true);
+        connect(check, &QPushButton::clicked, this, &JobDialog::checkSshPaths);
+        auto *cw = new QWidget;
+        auto *cl = new QHBoxLayout(cw);
+        cl->setContentsMargins(0, 0, 0, 0);
+        cl->addWidget(check);
+        cl->addWidget(m_sshStatus, 1);
+        m_sshKind = new QComboBox;
+        m_sshKind->addItem(tr("Полная"), "full");
+        m_sshKind->addItem(tr("Инкрементная (изменения с прошлой копии)"), "incremental");
+        m_sshKind->addItem(tr("Дифференциальная (изменения с последней полной)"), "differential");
+        m_sshFullEvery = new QSpinBox;
+        m_sshFullEvery->setRange(0, 1000);
+        m_sshFullEvery->setSpecialValueText(tr("никогда"));
+        m_sshFullEvery->setSuffix(tr(" копий"));
+        connect(m_sshKind, &QComboBox::currentIndexChanged, this,
+                [this] { m_sshFullEvery->setEnabled(m_sshKind->currentData().toString() != QLatin1String("full")); });
+        m_sshFullEvery->setEnabled(false);
+        m_sshInclude = new QLineEdit;
+        m_sshInclude->setPlaceholderText(tr("все файлы; или напр. *.php; *.jpg"));
+        m_sshExclude = new QLineEdit;
+        m_sshExclude->setPlaceholderText(QStringLiteral("cache/**; *.log; **/node_modules/**"));
+        f->addRow(tr("Сервер SSH:"), m_sshConn);
+        f->addRow(tr("Каталоги:"), m_sshPaths);
+        f->addRow(QString(), cw);
+        f->addRow(tr("Тип копии:"), m_sshKind);
+        f->addRow(tr("Полная каждые:"), m_sshFullEvery);
+        f->addRow(tr("Включать:"), m_sshInclude);
+        f->addRow(tr("Исключать:"), m_sshExclude);
+        auto *hint = new QLabel(tr("Файлы скачиваются по SFTP. Инкрементная копия забирает только изменённые файлы "
+                                   "(по размеру и времени изменения). Символические ссылки и пустые каталоги не "
+                                   "копируются. Для полной копии сайта добавьте второе задание «Базы MySQL по SSH» "
+                                   "и объедините их в группу с общим расписанием."));
         hint->setWordWrap(true);
         theme::markHint(hint);
         f->addRow(hint);
@@ -680,6 +775,24 @@ void JobDialog::load(const QJsonObject &job) {
         m_pgDump->setText(s.value("pg_dump").toString());
         m_pgGlobals->setChecked(s.value("globals").toBool(false));
         m_pgVerify->setChecked(s.value("verify").toBool(true));
+    } else if (st == "mysql") {
+        m_myConn->setSource(s);
+        m_myHost->setText(s.value("db_host").toString());
+        m_myPort->setValue(s.value("db_port").toInt(0));
+        m_myUser->setText(s.value("db_user").toString());
+        m_myPassword->setStored(s.value("db_password").toString());
+        QStringList dbs;
+        for (const auto &d : s.value("databases").toArray()) dbs << d.toString();
+        setDbList(m_myDatabases, dbs, {});
+        m_myArchives->setCurrentIndex(s.value("separate_archives").toBool(false) ? 1 : 0);
+    } else if (st == "ssh_files") {
+        m_sshConn->setSource(s);
+        m_sshPaths->setPlainText(joinArray(s.value("paths"), "\n"));
+        m_sshInclude->setText(joinArray(s.value("include"), "; "));
+        m_sshExclude->setText(joinArray(s.value("exclude"), "; "));
+        m_sshKind->setCurrentIndex(indexOfData(m_sshKind, s.value("kind").toString("full")));
+        m_sshFullEvery->setValue(s.value("full_every").toInt());
+        m_sshFullEvery->setEnabled(m_sshKind->currentData().toString() != QLatin1String("full"));
     } else if (st == "hyper_v") {
         m_vmName->setCurrentText(s.value("vm_name").toString());
         m_vmKind->setCurrentIndex(indexOfData(m_vmKind, s.value("kind").toString("full")));
@@ -823,6 +936,27 @@ QJsonObject JobDialog::value() const {
         s["pg_dump"] = optString(m_pgDump->text());
         s["globals"] = m_pgGlobals->isChecked();
         s["verify"] = m_pgVerify->isChecked();
+    } else if (st == "mysql") {
+        m_myConn->apply(s);
+        s["db_host"] = optString(m_myHost->text());
+        if (m_myPort->value() > 0)
+            s["db_port"] = m_myPort->value();
+        else
+            s.remove(QStringLiteral("db_port"));
+        s["db_user"] = m_myUser->text().trimmed();
+        s["db_password"] = m_myPassword->value();
+        s["databases"] = toArray(dbChecked(m_myDatabases));
+        s["separate_archives"] = m_myArchives->currentData().toBool();
+    } else if (st == "ssh_files") {
+        m_sshConn->apply(s);
+        QStringList paths;
+        for (const auto &p : m_sshPaths->toPlainText().split('\n', Qt::SkipEmptyParts))
+            if (!p.trimmed().isEmpty()) paths << p.trimmed();
+        s["paths"] = toArray(paths);
+        s["include"] = toArray(util::splitList(m_sshInclude->text()));
+        s["exclude"] = toArray(util::splitList(m_sshExclude->text()));
+        s["kind"] = m_sshKind->currentData().toString();
+        s["full_every"] = m_sshFullEvery->value();
     } else if (st == "hyper_v") {
         s["vm_name"] = m_vmName->currentText().trimmed();
         s["kind"] = m_vmKind->currentData().toString();
@@ -908,6 +1042,12 @@ QString JobDialog::validate(int *tab) const {
     if (st == "postgresql" && s.value("connection").toString().isEmpty() && s.value("user").toString().isEmpty() &&
         s.value("host").toString().isEmpty())
         return at(0, tr("Выберите подключение PostgreSQL. Если списка нет — «Подключения…», тип «PostgreSQL»."));
+    const bool noSsh = s.value("connection").toString().isEmpty() && !s.value("ssh").isObject();
+    if ((st == "mysql" || st == "ssh_files") && noSsh)
+        return at(0, tr("Выберите сервер SSH. Если списка нет — «Подключения…», тип «SSH (сервер сайта)»."));
+    if (st == "mysql" && s.value("db_user").toString().isEmpty()) return at(0, tr("Укажите пользователя базы данных."));
+    if (st == "ssh_files" && s.value("paths").toArray().isEmpty())
+        return at(0, tr("Укажите хотя бы один каталог на сервере."));
     if (st == "hyper_v" && s.value("vm_name").toString().isEmpty()) return at(0, tr("Укажите имя виртуальной машины."));
     if (j.value("destinations").toArray().isEmpty()) return at(1, tr("Добавьте хотя бы одно назначение."));
     const QJsonObject sc = j.value("schedule").toObject();
@@ -989,15 +1129,25 @@ QComboBox *JobDialog::makeArchiveMode() {
 
 void JobDialog::loadDatabases(const QString &type, bool automatic) {
     const bool sql = type == QLatin1String("ms_sql");
-    QLabel *status = sql ? m_sqlStatus : m_pgStatus;
+    const bool my = type == QLatin1String("mysql");
+    QLabel *status = sql ? m_sqlStatus : (my ? m_myStatus : m_pgStatus);
+    QListWidget *list = sql ? m_sqlDatabases : (my ? m_myDatabases : m_pgDatabases);
     // Источник из текущего состояния формы: служба сама подставит учётные данные подключения.
     QJsonObject s = value().value("source").toObject();
     if (s.value("type").toString() != type) return;
     const bool hasConn = !s.value("connection").toString().isEmpty();
-    const bool hasInline = !s.value(sql ? "server" : "host").toString().isEmpty();
+    const bool hasInline = my ? s.value("ssh").isObject() : !s.value(sql ? "server" : "host").toString().isEmpty();
     if (!hasConn && !hasInline) {
         if (!automatic) {
             status->setText(tr("Выберите подключение."));
+            theme::setState(status, theme::Warn);
+        }
+        return;
+    }
+    // MySQL: без пользователя БД проверять нечего; при смене SSH-подключения молча ждём ввода.
+    if (my && s.value("db_user").toString().isEmpty()) {
+        if (!automatic) {
+            status->setText(tr("Укажите пользователя базы данных."));
             theme::setState(status, theme::Warn);
         }
         return;
@@ -1006,7 +1156,7 @@ void JobDialog::loadDatabases(const QString &type, bool automatic) {
     status->setText(tr("Подключение к серверу…"));
     theme::setState(status, theme::Muted);
     m_client->call({{"cmd", "list_databases"}, {"source", s}},
-                   [this, sql, status, seq](bool ok, const QJsonValue &r, const QString &err) {
+                   [this, list, status, seq](bool ok, const QJsonValue &r, const QString &err) {
         if (seq != m_dbSeq) return;
         if (!ok) {
             status->setText(tr("Ошибка подключения: %1").arg(err));
@@ -1015,7 +1165,6 @@ void JobDialog::loadDatabases(const QString &type, bool automatic) {
         }
         QStringList names;
         for (const auto &v : r.toArray()) names << v.toString();
-        QListWidget *list = sql ? m_sqlDatabases : m_pgDatabases;
         setDbList(list, dbChecked(list), names);
         QStringList missing;
         for (const auto &c : dbChecked(list))
@@ -1027,6 +1176,40 @@ void JobDialog::loadDatabases(const QString &type, bool automatic) {
         }
         status->setText(tr("Подключение работает, баз на сервере: %1.").arg(names.size()));
         theme::setState(status, theme::Ok);
+    }, this);
+}
+
+void JobDialog::checkSshPaths() {
+    const QJsonObject s = value().value("source").toObject();
+    if (s.value("connection").toString().isEmpty() && !s.value("ssh").isObject()) {
+        m_sshStatus->setText(tr("Выберите сервер SSH."));
+        theme::setState(m_sshStatus, theme::Warn);
+        return;
+    }
+    m_sshStatus->setText(tr("Подключение к серверу…"));
+    theme::setState(m_sshStatus, theme::Muted);
+    m_client->call({{"cmd", "check_ssh_paths"}, {"source", s}}, [this](bool ok, const QJsonValue &r, const QString &err) {
+        if (!ok) {
+            m_sshStatus->setText(tr("Ошибка: %1").arg(err));
+            theme::setState(m_sshStatus, theme::Error);
+            return;
+        }
+        const QJsonObject o = r.toObject();
+        QStringList bad;
+        int found = 0;
+        for (const auto &v : o.value("paths").toArray()) {
+            const QJsonObject p = v.toObject();
+            if (p.value("ok").toBool()) ++found;
+            else bad << p.value("path").toString();
+        }
+        QString t = bad.isEmpty() ? tr("✔ %1: найдено каталогов %2.").arg(o.value("target").toString()).arg(found)
+                                  : tr("Подключение работает, но не найдено: %1.").arg(bad.join(", "));
+        const QString fp = o.value("host_key").toString();
+        if (!fp.isEmpty())
+            t += tr("\nОтпечаток сервера не закреплён: %1 — впишите его в подключение SSH.").arg(fp);
+        m_sshStatus->setText(t);
+        m_sshStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        theme::setState(m_sshStatus, bad.isEmpty() ? theme::Ok : theme::Warn);
     }, this);
 }
 

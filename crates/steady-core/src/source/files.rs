@@ -31,13 +31,17 @@ struct Manifest<'a> {
     failed: Vec<String>,
 }
 
-struct Filter {
+pub(super) struct Filter {
     inc: Option<GlobSet>,
     exc: Option<GlobSet>,
 }
 
 impl Filter {
-    fn accepts(&self, rel: &str) -> bool {
+    pub(super) fn new(include: &[String], exclude: &[String]) -> Result<Self> {
+        Ok(Filter { inc: build_set(include)?, exc: build_set(exclude)? })
+    }
+
+    pub(super) fn accepts(&self, rel: &str) -> bool {
         let name = rel.rsplit('/').next().unwrap_or(rel);
         if let Some(s) = &self.inc {
             if !s.is_match(rel) && !s.is_match(name) {
@@ -53,26 +57,26 @@ impl Filter {
     }
 }
 
-struct Run<'a> {
+pub(super) struct Run<'a> {
     base: Option<&'a Catalog>,
-    data_root: PathBuf,
+    pub(super) data_root: PathBuf,
     current: Catalog,
     copied: Vec<String>,
     failed: Vec<String>,
-    skipped_links: u32,
-    empty_dirs: u32,
+    pub(super) skipped_links: u32,
+    pub(super) empty_dirs: u32,
     /// Ключи каталогов, которые не удалось обойти. Файлы под ними не видели и не считаем удалёнными.
-    unseen_prefixes: Vec<String>,
+    pub(super) unseen_prefixes: Vec<String>,
     bytes: u64,
 }
 
 impl Run<'_> {
     /// Нужно ли копировать файл; заодно учитывает его в текущем каталоге.
-    fn changed(&self, key: &str, stamp: &FileStamp) -> bool {
+    pub(super) fn changed(&self, key: &str, stamp: &FileStamp) -> bool {
         self.base.map_or(true, |b| b.files.get(key) != Some(stamp))
     }
 
-    fn record(&mut self, key: String, stamp: FileStamp, copied: Option<u64>) {
+    pub(super) fn record(&mut self, key: String, stamp: FileStamp, copied: Option<u64>) {
         if let Some(n) = copied {
             self.bytes += n;
             self.copied.push(key.clone());
@@ -80,13 +84,13 @@ impl Run<'_> {
         self.current.files.insert(key, stamp);
     }
 
-    fn fail(&mut self, key: String, err: impl std::fmt::Display) {
+    pub(super) fn fail(&mut self, key: String, err: impl std::fmt::Display) {
         tracing::warn!("{key}: {err}");
         // Не заносим в каталог: файл попадёт в следующую копию.
         self.failed.push(key);
     }
 
-    fn dst(&self, key: &str) -> Result<PathBuf> {
+    pub(super) fn dst(&self, key: &str) -> Result<PathBuf> {
         let p = self.data_root.join(key.replace('/', "\\"));
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
@@ -99,55 +103,74 @@ pub fn prepare(p: &FilesParams, state: &JobState, staging: &Path) -> Result<Prep
     if p.paths.is_empty() {
         bail!("не указаны исходные папки");
     }
-    let filter = Filter { inc: build_set(p.include)?, exc: build_set(p.exclude)? };
-
-    let kind = match p.requested {
-        BackupKind::Full => BackupKind::Full,
-        _ if state.force_full || state.last_full.is_none() => BackupKind::Full,
-        _ if p.full_every > 0 && state.since_full >= p.full_every => BackupKind::Full,
-        k => k,
-    };
-    let base = match kind {
-        BackupKind::Full => None,
-        BackupKind::Differential => state.last_full.as_ref(),
-        BackupKind::Incremental => state.last_any.as_ref(),
-    };
-
-    let mut run = Run {
-        base,
-        data_root: staging.join("data"),
-        current: Catalog::default(),
-        copied: vec![],
-        failed: vec![],
-        skipped_links: 0,
-        empty_dirs: 0,
-        unseen_prefixes: vec![],
-        bytes: 0,
-    };
+    let filter = Filter::new(p.include, p.exclude)?;
+    let kind = effective_kind(p.requested, p.full_every, state);
+    let mut run = Run::start(kind, state, staging);
 
     for (idx, root) in p.paths.iter().enumerate() {
         let is_dav = root.starts_with("http://") || root.starts_with("https://");
-        let leaf = root.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("root");
-        let leaf = percent_encoding::percent_decode_str(leaf).decode_utf8_lossy();
         // Каждый источник в своей подпапке: "0_Docs", "1_Projects" ...
-        let label = format!("{idx}_{}", crate::pipeline::safe_name(&leaf));
+        let label = root_label(idx, root);
         if is_dav {
             scan_webdav(&mut run, &filter, root, &label, p.user, p.password)?;
         } else {
             scan_fs(&mut run, &filter, Path::new(root), &label)?;
         }
     }
+    finish(run, kind, state, staging, p.paths)
+}
 
+/// Вид копии с учётом состояния: первая, принудительная и «полная каждые N» — полные.
+pub(super) fn effective_kind(requested: BackupKind, full_every: u32, state: &JobState) -> BackupKind {
+    match requested {
+        BackupKind::Full => BackupKind::Full,
+        _ if state.force_full || state.last_full.is_none() => BackupKind::Full,
+        _ if full_every > 0 && state.since_full >= full_every => BackupKind::Full,
+        k => k,
+    }
+}
+
+/// Метка корня источника в каталоге и в архиве: "0_Docs", "1_Projects" …
+pub(super) fn root_label(idx: usize, root: &str) -> String {
+    let leaf = root.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("root");
+    let leaf = percent_encoding::percent_decode_str(leaf).decode_utf8_lossy();
+    format!("{idx}_{}", crate::pipeline::safe_name(&leaf))
+}
+
+impl<'a> Run<'a> {
+    pub(super) fn start(kind: BackupKind, state: &'a JobState, staging: &Path) -> Self {
+        let base = match kind {
+            BackupKind::Full => None,
+            BackupKind::Differential => state.last_full.as_ref(),
+            BackupKind::Incremental => state.last_any.as_ref(),
+        };
+        Run {
+            base,
+            data_root: staging.join("data"),
+            current: Catalog::default(),
+            copied: vec![],
+            failed: vec![],
+            skipped_links: 0,
+            empty_dirs: 0,
+            unseen_prefixes: vec![],
+            bytes: 0,
+        }
+    }
+}
+
+/// Манифест, новое состояние и предупреждения по итогам обхода.
+pub(super) fn finish(run: Run, kind: BackupKind, state: &JobState, staging: &Path, sources: &[String]) -> Result<Prepared> {
     // Удалён = был в базе и точно отсутствует сейчас. Непрочитанный файл и всё под каталогом,
     // который не удалось обойти, в базу не попали — это не удаление.
-    let deleted: Vec<String> = base
+    let deleted: Vec<String> = run
+        .base
         .map(|b| b.files.keys().filter(|k| !seen(&run, k)).cloned().collect())
         .unwrap_or_default();
 
     let manifest = Manifest {
         kind,
         created: chrono::Local::now(),
-        sources: p.paths,
+        sources,
         copied: run.copied,
         deleted,
         failed: run.failed,

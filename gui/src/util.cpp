@@ -84,6 +84,8 @@ QString sourceTitle(const QString &type) {
     if (type == QLatin1String("hyper_v")) return QObject::tr("Hyper-V");
     if (type == QLatin1String("firebird")) return QObject::tr("Firebird");
     if (type == QLatin1String("postgresql")) return QObject::tr("PostgreSQL");
+    if (type == QLatin1String("mysql")) return QObject::tr("MySQL (SSH)");
+    if (type == QLatin1String("ssh_files")) return QObject::tr("Файлы (SSH)");
     return type;
 }
 
