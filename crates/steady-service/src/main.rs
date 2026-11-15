@@ -2,6 +2,7 @@ mod engine;
 mod ipc;
 #[cfg(windows)]
 mod service;
+mod updater;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

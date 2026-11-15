@@ -16,6 +16,7 @@ pub mod source;
 pub mod ssh;
 pub mod state;
 pub mod store;
+pub mod update;
 pub mod util;
 
 pub use job::*;

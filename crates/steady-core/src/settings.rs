@@ -13,6 +13,9 @@ pub struct ServiceSettings {
     /// Абсолютный путь. Пусто — `<data>\work`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_dir: Option<String>,
+    /// Проверка и установка новых версий.
+    #[serde(default)]
+    pub update: crate::update::UpdateSettings,
 }
 
 impl ServiceSettings {
@@ -195,11 +198,11 @@ mod tests {
     #[test]
     fn rejects_root_data_dir_and_its_parent() {
         let data = Path::new(r"C:\ProgramData\SteadyBackup");
-        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(r"C:\".into()) }).is_err());
-        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(r"C:\ProgramData".into()) }).is_err());
-        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(data.display().to_string()) }).is_err());
-        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(r"work".into()) }).unwrap_err().to_string().contains("абсолютным"));
-        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(r"D:\Backup\work".into()) }).is_ok());
+        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(r"C:\".into()), ..Default::default() }).is_err());
+        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(r"C:\ProgramData".into()), ..Default::default() }).is_err());
+        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(data.display().to_string()), ..Default::default() }).is_err());
+        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(r"work".into()), ..Default::default() }).unwrap_err().to_string().contains("абсолютным"));
+        assert!(resolve_work_dir(data, &ServiceSettings { work_dir: Some(r"D:\Backup\work".into()), ..Default::default() }).is_ok());
     }
 
     #[test]

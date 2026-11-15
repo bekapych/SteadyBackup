@@ -7,6 +7,7 @@
 #include "resourcesdialog.h"
 #include "serviceclient.h"
 #include "theme.h"
+#include "updatedialog.h"
 #include "util.h"
 
 #include <QAction>
@@ -220,7 +221,13 @@ QWidget *MainWindow::buildHeader() {
     menu->addSeparator();
     menu->addAction(tr("Экспорт настроек…"), this, [this] { exportSettings(); });
     menu->addAction(tr("Импорт настроек…"), this, [this] { importSettings(); });
+    menu->addSeparator();
+    menu->addAction(tr("Обновление программы…"), this, [this] { showUpdates(); });
     m_settingsButton->setMenu(menu);
+
+    m_updateButton = new QPushButton;
+    m_updateButton->hide();
+    connect(m_updateButton, &QPushButton::clicked, this, [this] { showUpdates(); });
 
     m_newButton = new QPushButton(tr("Новое задание"));
     m_newButton->setObjectName(QStringLiteral("primary"));
@@ -232,6 +239,7 @@ QWidget *MainWindow::buildHeader() {
     h->addSpacing(12);
     h->addWidget(m_statePill);
     h->addStretch(1);
+    h->addWidget(m_updateButton);
     h->addWidget(m_refreshButton);
     h->addWidget(m_settingsButton);
     h->addSpacing(4);
@@ -473,6 +481,24 @@ void MainWindow::applyStatus(const QJsonObject &st) {
     theme::setState(m_statePill, theme::Ok);
     const QJsonValue running = st.value("running");
     m_runningId = running.isObject() ? running.toObject().value("job_id").toString() : QString();
+    // Новая версия: кнопка в заголовке и одно сообщение в трее за сеанс.
+    const QJsonObject upd = st.value("update").toObject();
+    const QString avail = upd.value("available").toString();
+    const QString phase = upd.value("phase").toString();
+    if (phase == QLatin1String("downloading") || phase == QLatin1String("installing")) {
+        m_updateButton->setText(tr("Устанавливается обновление…"));
+        m_updateButton->show();
+    } else if (!avail.isEmpty()) {
+        m_updateButton->setText(tr("Доступна версия %1").arg(avail));
+        m_updateButton->show();
+        if (m_updateNotified != avail) {
+            m_updateNotified = avail;
+            m_tray->showMessage(tr("SteadyBackup"), tr("Доступна новая версия %1. Настройки → Обновление программы.").arg(avail),
+                                QSystemTrayIcon::Information, 8000);
+        }
+    } else {
+        m_updateButton->hide();
+    }
     updateBanner();
     updateCards();
     updateActions();
@@ -943,6 +969,10 @@ void MainWindow::takeShots(const QString &dir) {
                 DestinationDialog dd(m_client, QJsonObject{{"type", "storage"}, {"folder", "PayDesk"}}, this);
                 snap(dd, dir + "/destination.png");
             }
+            {
+                UpdateDialog ud(m_client, m_admin, this);
+                snap(ud, dir + "/update.png");
+            }
             m_quitting = true;
             qApp->quit();
         };
@@ -1099,6 +1129,12 @@ void MainWindow::editWorkDir() {
             if (!ok) showError(err);
         });
     });
+}
+
+void MainWindow::showUpdates() {
+    UpdateDialog dlg(m_client, m_admin, this);
+    dlg.exec();
+    refresh();
 }
 
 void MainWindow::restartElevated() {

@@ -50,6 +50,8 @@ struct Inner {
     delayed: Vec<(std::time::Instant, Queued)>,
     running: Option<Running>,
     stop: bool,
+    /// Идёт установка обновления: исполнитель не берёт задания, установщик вот-вот остановит службу.
+    updating: bool,
     /// Флаг отмены текущего запуска. Новый на каждое задание: однажды выставленный флаг
     /// не сбрасывается, и общий флаг после одной отмены прерывал бы все следующие задания.
     cancel: steady_core::process::CancelFlag,
@@ -59,6 +61,7 @@ pub struct Engine {
     pub store: Store,
     pub data_dir: PathBuf,
     pub seven_zip: Option<PathBuf>,
+    pub updater: crate::updater::Updater,
     worker_done: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     inner: Mutex<Inner>,
     cv: Condvar,
@@ -70,6 +73,7 @@ impl Engine {
     pub fn new(data_dir: PathBuf, seven_zip: Option<PathBuf>, console: bool) -> Arc<Self> {
         Arc::new(Self {
             store: if console { Store::new(&data_dir) } else { Store::for_service(&data_dir) },
+            updater: crate::updater::Updater::new(data_dir.clone(), console),
             data_dir,
             seven_zip,
             worker_done: Mutex::new(None),
@@ -97,6 +101,46 @@ impl Engine {
         }).unwrap();
         let e = self.clone();
         std::thread::Builder::new().name("scheduler".into()).spawn(move || e.scheduler()).unwrap();
+        crate::updater::spawn(self.clone());
+    }
+
+    /// Есть выполняющееся, стоящее в очереди или ждущее перезапуска задание.
+    pub fn is_busy(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.running.is_some() || !g.queue.is_empty() || !g.delayed.is_empty()
+    }
+
+    /// Начать установку обновления: только если служба свободна. Пока признак стоит,
+    /// исполнитель не берёт задания из очереди.
+    pub fn begin_update(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if g.stop || g.running.is_some() || !g.queue.is_empty() || !g.delayed.is_empty() {
+            return false;
+        }
+        g.updating = true;
+        true
+    }
+
+    /// Установка не состоялась: задания снова выполняются.
+    pub fn end_update(&self) {
+        self.inner.lock().unwrap().updating = false;
+        self.cv.notify_all();
+    }
+
+    /// Пауза, которую прерывает остановка службы. false — служба останавливается.
+    pub fn sleep_unless_stopped(&self, d: Duration) -> bool {
+        let end = std::time::Instant::now() + d;
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if g.stop {
+                return false;
+            }
+            let now = std::time::Instant::now();
+            if now >= end {
+                return true;
+            }
+            g = self.cv.wait_timeout(g, end - now).unwrap().0;
+        }
     }
 
     pub fn stop(&self) {
@@ -140,7 +184,8 @@ impl Engine {
     /// Ставит задание в очередь с повторами группы. Ждущий перезапуск заменяется новым запуском.
     fn enqueue_with(&self, id: Uuid, retry: RetryOverride) -> bool {
         let mut g = self.inner.lock().unwrap();
-        if g.queue.iter().any(|q| q.id == id) || g.running.as_ref().is_some_and(|r| r.job_id == id) {
+        // Во время установки обновления служба вот-вот остановится, очередь пропадёт.
+        if g.updating || g.queue.iter().any(|q| q.id == id) || g.running.as_ref().is_some_and(|r| r.job_id == id) {
             return false;
         }
         g.delayed.retain(|(_, q)| q.id != id);
@@ -170,8 +215,10 @@ impl Engine {
                         std::mem::take(&mut g.delayed).into_iter().partition(|(at, _)| *at <= now);
                     g.delayed = wait;
                     g.queue.extend(due.into_iter().map(|(_, q)| q));
-                    if let Some(q) = g.queue.pop_front() {
-                        break q;
+                    if !g.updating {
+                        if let Some(q) = g.queue.pop_front() {
+                            break q;
+                        }
                     }
                     g = match g.delayed.iter().map(|(at, _)| *at).min() {
                         Some(at) => self.cv.wait_timeout(g, at.saturating_duration_since(now)).unwrap().0,
@@ -354,6 +401,11 @@ impl Engine {
 
     /// Одна проверка расписания. Метка задания — момент, до которого расписание уже обработано.
     fn tick(&self, now: NaiveDateTime) -> anyhow::Result<()> {
+        // Во время обновления метки не двигаем: подошедший запуск новая служба выполнит
+        // как пропущенный (по правилам run_missed), а не потеряет.
+        if self.inner.lock().unwrap().updating {
+            return Ok(());
+        }
         let jobs = self.store.load_jobs()?;
         let mut marks = self.store.load_marks();
         let before = marks.clone();
@@ -484,6 +536,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let e = Arc::new(Engine {
             store: Store::new(&dir),
+            updater: crate::updater::Updater::new(dir.clone(), true),
             data_dir: dir.clone(),
             seven_zip: None,
             worker_done: Mutex::new(None),

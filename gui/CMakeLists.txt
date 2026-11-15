@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(SteadyBackupGui VERSION 0.1.9 LANGUAGES CXX)
+project(SteadyBackupGui VERSION 0.1.10 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,6 +23,7 @@ qt_add_executable(steady-gui WIN32
     src/resourcesdialog.cpp src/resourcesdialog.h
     src/connectionpicker.cpp src/connectionpicker.h
     src/groupdialog.cpp src/groupdialog.h
+    src/updatedialog.cpp src/updatedialog.h
     src/util.cpp src/util.h
     src/theme.cpp src/theme.h
     res/res.qrc

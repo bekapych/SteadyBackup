@@ -134,6 +134,14 @@ enum Request {
     RunGroup { group_id: Uuid },
     /// Копия задания: новый id, имя «(копия)», те же источник, назначения и расписание.
     CopyJob { job_id: Uuid },
+    /// Состояние обновления: текущая и последняя версии, настройки, итог прошлой установки.
+    UpdateStatus,
+    /// Проверить выпуски на GitHub сейчас.
+    CheckUpdate,
+    /// Скачать и установить новую версию (в фоне; служба при этом перезапускается).
+    InstallUpdate,
+    /// Настройки обновления.
+    SaveUpdateSettings { settings: steady_core::update::UpdateSettings },
     /// Все задания и настройки. Пароли в ответе открытым текстом — только для файла переноса.
     ExportSettings,
     /// `text` — содержимое файла, созданного export_settings.
@@ -342,7 +350,7 @@ fn take_correlation_id(raw: &mut Value) -> Value {
     Value::Null
 }
 
-fn dispatch(engine: &Engine, raw: Value, admin: bool) -> Result<Value> {
+fn dispatch(engine: &Arc<Engine>, raw: Value, admin: bool) -> Result<Value> {
     let req: Request = serde_json::from_value(raw).map_err(|e| anyhow!("неверный запрос: {e}"))?;
     let read_only = matches!(
         req,
@@ -355,6 +363,7 @@ fn dispatch(engine: &Engine, raw: Value, admin: bool) -> Result<Value> {
             | Request::ListConnections
             | Request::GetSettings
             | Request::ListGroups
+            | Request::UpdateStatus
     );
     if !read_only && !admin {
         bail!("доступ запрещён: команда доступна только администраторам");
@@ -362,7 +371,8 @@ fn dispatch(engine: &Engine, raw: Value, admin: bool) -> Result<Value> {
     Ok(match req {
         Request::Status => {
             let (running, queue) = engine.snapshot();
-            json!({ "version": env!("CARGO_PKG_VERSION"), "running": running, "queue": queue, "admin": admin })
+            json!({ "version": env!("CARGO_PKG_VERSION"), "running": running, "queue": queue, "admin": admin,
+                    "update": engine.updater.brief() })
         }
         Request::ListJobs => {
             let jobs = engine.store.load_jobs()?;
@@ -606,9 +616,26 @@ fn dispatch(engine: &Engine, raw: Value, admin: bool) -> Result<Value> {
             let effective = steady_core::settings::work_dir(&engine.data_dir).unwrap_or_else(|_| engine.data_dir.join("work"));
             json!({ "work_dir": s.work_dir, "effective": effective })
         }
+        Request::UpdateStatus => engine.updater.status(),
+        Request::CheckUpdate => {
+            engine.updater.check_now()?;
+            engine.updater.status()
+        }
+        Request::InstallUpdate => {
+            let v = crate::updater::Updater::start_install(engine)?;
+            json!({ "version": v })
+        }
+        Request::SaveUpdateSettings { settings } => {
+            let mut s = steady_core::settings::ServiceSettings::load(&engine.data_dir);
+            s.update = settings;
+            s.save(&engine.data_dir)?;
+            engine.updater.status()
+        }
         Request::SaveSettings { work_dir } => {
+            // Остальные настройки (обновление) сохраняются как были.
             let s = steady_core::settings::ServiceSettings {
                 work_dir: work_dir.filter(|p| !p.trim().is_empty()),
+                ..steady_core::settings::ServiceSettings::load(&engine.data_dir)
             };
             let path = steady_core::settings::resolve_work_dir(&engine.data_dir, &s)?;
             // Свой каталог вне data\ — те же права, что у каталога данных. По умолчанию он уже под ним.

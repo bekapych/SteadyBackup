@@ -84,6 +84,8 @@ private:
     bool requireAdmin();
     void restartElevated();
     void editWorkDir();
+    // Окно «Обновление программы».
+    void showUpdates();
     void notifyFinished(const QJsonArray &history);
 
     ServiceClient *m_client;
@@ -101,6 +103,8 @@ private:
     QLabel *m_emptyIcon;
     QToolButton *m_settingsButton;
     QToolButton *m_refreshButton;
+    QPushButton *m_updateButton; // «Доступна версия …» в заголовке
+    QString m_updateNotified;    // версия, о которой уже сообщили в трее
     QComboBox *m_historyFilter;
     QCheckBox *m_historyOnlyJob = nullptr;
     Card m_cards[CardCount];
