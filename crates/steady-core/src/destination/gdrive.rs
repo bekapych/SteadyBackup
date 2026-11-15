@@ -21,7 +21,11 @@ const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// Для настольных приложений Google не считает client secret секретом: защиту входа обеспечивают
 /// согласие пользователя и PKCE; секретом является только refresh-токен (хранится в DPAPI).
 pub const BUILTIN_CLIENT_ID: &str = "854340264669-k30660ita57nhj74kto18c6fitk3s7f2.apps.googleusercontent.com";
-pub const BUILTIN_CLIENT_SECRET: &str = "";
+///
+/// Секрет в исходники не кладётся: его подставляет сборка из переменной окружения
+/// `STEADY_GDRIVE_SECRET` или из файла `gdrive-secret.txt` в корне (он в `.gitignore`),
+/// см. `build.rs`. Без него встроенный вход в Google Drive не работает — нужен свой OAuth-клиент.
+pub const BUILTIN_CLIENT_SECRET: &str = env!("STEADY_GDRIVE_SECRET");
 
 /// Кратно 256 КБ, как требует API.
 const CHUNK: usize = 32 * 1024 * 1024;
@@ -121,8 +125,19 @@ pub struct AuthFlow {
     state: String,
 }
 
+/// Встроенный клиент собран без секрета (сборка из исходников без `gdrive-secret.txt`).
+pub fn builtin_available() -> bool {
+    !BUILTIN_CLIENT_SECRET.is_empty()
+}
+
 impl AuthFlow {
     pub fn start(client_id: &str) -> Result<Self> {
+        if client_id == BUILTIN_CLIENT_ID && !builtin_available() {
+            bail!(
+                "эта сборка без встроенного OAuth-клиента Google: укажите в хранилище свой Client ID и Client Secret \
+                 (Google Cloud Console, тип Desktop app)"
+            );
+        }
         use sha2::Digest;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let redirect = format!("http://127.0.0.1:{}/", listener.local_addr()?.port());

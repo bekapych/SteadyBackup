@@ -37,5 +37,13 @@
 build.cmd
 ```
 
-Нужны Rust, Qt 6 (MSYS2 UCRT64), CMake, Ninja и WiX 3.14. Подробности — [AGENTS.md](AGENTS.md),
+Нужны Rust, Qt 6 (MSYS2 UCRT64), CMake, Ninja и WiX 3.14.
+
+Встроенный вход в Google Drive требует секрета OAuth-клиента: переменная окружения
+`STEADY_GDRIVE_SECRET` или файл `gdrive-secret.txt` в корне (в git не попадает). Без него программа
+собирается, а для Google Drive в хранилище указывается свой Client ID и Client Secret.
+
+## Лицензия
+
+[MIT](LICENSE) Подробности — [AGENTS.md](AGENTS.md),
 формат заданий — [examples/jobs.md](examples/jobs.md), устройство — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

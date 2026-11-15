@@ -4,3 +4,4 @@ dist/
 *.log
 *.log.*.gz
 build-logs/
+gdrive-secret.txt
