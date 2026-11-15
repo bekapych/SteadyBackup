@@ -1,0 +1,433 @@
+//! Файлы и папки (локальные, UNC, WebDAV): полная, инкрементная, дифференциальная копия.
+
+use super::Prepared;
+use crate::destination::webdav::WebDavClient;
+use crate::job::BackupKind;
+use crate::state::{stamp_of, Catalog, FileStamp, JobState};
+use anyhow::{bail, Context, Result};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+
+pub struct FilesParams<'a> {
+    pub paths: &'a [String],
+    pub user: Option<&'a str>,
+    pub password: Option<&'a str>,
+    pub include: &'a [String],
+    pub exclude: &'a [String],
+    pub requested: BackupKind,
+    pub full_every: u32,
+}
+
+#[derive(Serialize)]
+struct Manifest<'a> {
+    kind: BackupKind,
+    created: chrono::DateTime<chrono::Local>,
+    sources: &'a [String],
+    copied: Vec<String>,
+    /// Файлы, удалённые с момента базовой копии.
+    deleted: Vec<String>,
+    /// Файлы, которые не удалось прочитать (попадут в следующую копию).
+    failed: Vec<String>,
+}
+
+struct Filter {
+    inc: Option<GlobSet>,
+    exc: Option<GlobSet>,
+}
+
+impl Filter {
+    fn accepts(&self, rel: &str) -> bool {
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        if let Some(s) = &self.inc {
+            if !s.is_match(rel) && !s.is_match(name) {
+                return false;
+            }
+        }
+        if let Some(s) = &self.exc {
+            if s.is_match(rel) || s.is_match(name) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+struct Run<'a> {
+    base: Option<&'a Catalog>,
+    data_root: PathBuf,
+    current: Catalog,
+    copied: Vec<String>,
+    failed: Vec<String>,
+    skipped_links: u32,
+    empty_dirs: u32,
+    /// Ключи каталогов, которые не удалось обойти. Файлы под ними не видели и не считаем удалёнными.
+    unseen_prefixes: Vec<String>,
+    bytes: u64,
+}
+
+impl Run<'_> {
+    /// Нужно ли копировать файл; заодно учитывает его в текущем каталоге.
+    fn changed(&self, key: &str, stamp: &FileStamp) -> bool {
+        self.base.map_or(true, |b| b.files.get(key) != Some(stamp))
+    }
+
+    fn record(&mut self, key: String, stamp: FileStamp, copied: Option<u64>) {
+        if let Some(n) = copied {
+            self.bytes += n;
+            self.copied.push(key.clone());
+        }
+        self.current.files.insert(key, stamp);
+    }
+
+    fn fail(&mut self, key: String, err: impl std::fmt::Display) {
+        tracing::warn!("{key}: {err}");
+        // Не заносим в каталог: файл попадёт в следующую копию.
+        self.failed.push(key);
+    }
+
+    fn dst(&self, key: &str) -> Result<PathBuf> {
+        let p = self.data_root.join(key.replace('/', "\\"));
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        Ok(p)
+    }
+}
+
+pub fn prepare(p: &FilesParams, state: &JobState, staging: &Path) -> Result<Prepared> {
+    if p.paths.is_empty() {
+        bail!("не указаны исходные папки");
+    }
+    let filter = Filter { inc: build_set(p.include)?, exc: build_set(p.exclude)? };
+
+    let kind = match p.requested {
+        BackupKind::Full => BackupKind::Full,
+        _ if state.force_full || state.last_full.is_none() => BackupKind::Full,
+        _ if p.full_every > 0 && state.since_full >= p.full_every => BackupKind::Full,
+        k => k,
+    };
+    let base = match kind {
+        BackupKind::Full => None,
+        BackupKind::Differential => state.last_full.as_ref(),
+        BackupKind::Incremental => state.last_any.as_ref(),
+    };
+
+    let mut run = Run {
+        base,
+        data_root: staging.join("data"),
+        current: Catalog::default(),
+        copied: vec![],
+        failed: vec![],
+        skipped_links: 0,
+        empty_dirs: 0,
+        unseen_prefixes: vec![],
+        bytes: 0,
+    };
+
+    for (idx, root) in p.paths.iter().enumerate() {
+        let is_dav = root.starts_with("http://") || root.starts_with("https://");
+        let leaf = root.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("root");
+        let leaf = percent_encoding::percent_decode_str(leaf).decode_utf8_lossy();
+        // Каждый источник в своей подпапке: "0_Docs", "1_Projects" ...
+        let label = format!("{idx}_{}", crate::pipeline::safe_name(&leaf));
+        if is_dav {
+            scan_webdav(&mut run, &filter, root, &label, p.user, p.password)?;
+        } else {
+            scan_fs(&mut run, &filter, Path::new(root), &label)?;
+        }
+    }
+
+    // Удалён = был в базе и точно отсутствует сейчас. Непрочитанный файл и всё под каталогом,
+    // который не удалось обойти, в базу не попали — это не удаление.
+    let deleted: Vec<String> = base
+        .map(|b| b.files.keys().filter(|k| !seen(&run, k)).cloned().collect())
+        .unwrap_or_default();
+
+    let manifest = Manifest {
+        kind,
+        created: chrono::Local::now(),
+        sources: p.paths,
+        copied: run.copied,
+        deleted,
+        failed: run.failed,
+    };
+    std::fs::create_dir_all(staging)?;
+    std::fs::write(staging.join("manifest.json"), serde_json::to_vec_pretty(&manifest)?)
+        .context("запись manifest.json")?;
+
+    let current = run.current;
+    let new_state = match kind {
+        BackupKind::Full => {
+            JobState { last_full: Some(current.clone()), last_any: Some(current), since_full: 0, hyperv_ref: None, force_full: false }
+        }
+        _ => JobState {
+            last_full: state.last_full.clone(),
+            last_any: Some(current),
+            since_full: state.since_full + 1,
+            hyperv_ref: None,
+            force_full: false,
+        },
+    };
+    let mut warnings = match manifest.failed.len() {
+        0 => vec![],
+        n => vec![format!("не удалось прочитать файлов: {n} (попадут в следующую копию), напр. {}", manifest.failed[0])],
+    };
+    if run.skipped_links > 0 {
+        warnings.push(format!("пропущены символические ссылки: {}", run.skipped_links));
+    }
+    if run.empty_dirs > 0 {
+        warnings.push(format!("пустые каталоги не копируются: {}", run.empty_dirs));
+    }
+    if !run.unseen_prefixes.is_empty() {
+        warnings.push(format!(
+            "не удалось обойти каталогов: {} (файлы в них не считаются удалёнными), напр. {}",
+            run.unseen_prefixes.len(),
+            run.unseen_prefixes[0]
+        ));
+    }
+    Ok(Prepared { kind, new_state: Some(new_state), items: manifest.copied.len() as u64, bytes: run.bytes, warnings, packed: false, parts: vec![], failures: vec![] })
+}
+
+fn scan_fs(run: &mut Run, filter: &Filter, root: &Path, label: &str) -> Result<()> {
+    if !root.exists() {
+        bail!("источник не найден: {}", root.display());
+    }
+    let mut dirs = std::collections::HashSet::new();
+    let mut nonempty = std::collections::HashSet::new();
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("пропуск: {e}");
+                // Ошибка обхода — обычно недоступный каталог. Без префикса все файлы под ним
+                // выпали бы из каталога и попали в deleted.
+                if let Some(path) = e.path() {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        let rel = rel.to_string_lossy().replace('\\', "/");
+                        let prefix = if rel.is_empty() { label.to_string() } else { format!("{label}/{rel}") };
+                        run.unseen_prefixes.push(prefix);
+                    }
+                }
+                continue;
+            }
+        };
+        if entry.file_type().is_symlink() || entry.path_is_symlink() {
+            run.skipped_links += 1;
+            continue;
+        }
+        if entry.file_type().is_dir() {
+            dirs.insert(entry.path().to_path_buf());
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let mut parent = entry.path().parent();
+        while let Some(p) = parent {
+            if !nonempty.insert(p.to_path_buf()) {
+                break;
+            }
+            parent = p.parent();
+        }
+        let rel = entry.path().strip_prefix(root)?.to_string_lossy().replace('\\', "/");
+        if !filter.accepts(&rel) {
+            continue;
+        }
+        crate::process::check_cancel()?;
+        let key = format!("{label}/{rel}");
+        let stamp = match stamp_of(entry.path()) {
+            Ok(s) => s,
+            Err(e) => {
+                run.fail(key, e);
+                continue;
+            }
+        };
+        if run.changed(&key, &stamp) {
+            crate::settings::ensure_free(&run.data_root, stamp.size)?;
+            let dst = run.dst(&key)?;
+            match std::fs::copy(entry.path(), &dst) {
+                Ok(n) => run.record(key, stamp, Some(n)),
+                Err(e) => run.fail(key, e),
+            }
+        } else {
+            run.record(key, stamp, None);
+        }
+    }
+    run.empty_dirs += dirs.iter().filter(|d| !nonempty.contains(*d)).count() as u32;
+    Ok(())
+}
+
+fn scan_webdav(run: &mut Run, filter: &Filter, url: &str, label: &str, user: Option<&str>, pw: Option<&str>) -> Result<()> {
+    let client = WebDavClient::new(url, user, pw)?;
+    let files = client.walk().with_context(|| format!("WebDAV-источник {url}"))?;
+    for f in files {
+        if !filter.accepts(&f.rel) {
+            continue;
+        }
+        crate::process::check_cancel()?;
+        let key = format!("{label}/{}", f.rel);
+        let stamp = FileStamp { size: f.size, mtime: f.mtime };
+        if run.changed(&key, &stamp) {
+            crate::settings::ensure_free(&run.data_root, stamp.size)?;
+            let dst = run.dst(&key)?;
+            match client.get_file(&f.rel, &dst) {
+                Ok(n) => run.record(key, stamp, Some(n)),
+                Err(e) => run.fail(key, e),
+            }
+        } else {
+            run.record(key, stamp, None);
+        }
+    }
+    Ok(())
+}
+
+/// Файл из базы ещё существует (или мы не смогли это проверить).
+fn seen(run: &Run, key: &str) -> bool {
+    run.current.files.contains_key(key)
+        || run.failed.iter().any(|f| f == key)
+        || run.unseen_prefixes.iter().any(|p| key == p || key.starts_with(p) && key[p.len()..].starts_with('/'))
+}
+
+fn build_set(patterns: &[String]) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut b = GlobSetBuilder::new();
+    for p in patterns {
+        b.add(Glob::new(p).with_context(|| format!("маска {p}"))?);
+    }
+    Ok(Some(b.build()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    fn run_stub(failed: &[&str], prefixes: &[&str]) -> Run<'static> {
+        Run {
+            base: None,
+            data_root: PathBuf::new(),
+            current: Catalog::default(),
+            copied: vec![],
+            failed: failed.iter().map(|s| (*s).to_string()).collect(),
+            unseen_prefixes: prefixes.iter().map(|s| (*s).to_string()).collect(),
+            skipped_links: 0,
+            empty_dirs: 0,
+            bytes: 0,
+        }
+    }
+
+    #[test]
+    fn seen_keeps_failed_and_unreadable_prefixes() {
+        let run = run_stub(&["0_src/busy.txt"], &["0_src/locked"]);
+        assert!(seen(&run, "0_src/busy.txt"));
+        assert!(seen(&run, "0_src/locked"));
+        assert!(seen(&run, "0_src/locked/a.txt"));
+        // Совпадение префикса без границы каталога — другой каталог.
+        assert!(!seen(&run, "0_src/locked-other/a.txt"));
+        assert!(!seen(&run, "0_src/gone.txt"));
+    }
+
+    #[derive(Deserialize)]
+    struct Man {
+        copied: Vec<String>,
+        deleted: Vec<String>,
+        failed: Vec<String>,
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("steady-files-{name}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn prepare_at(root: &Path, state: &JobState, kind: BackupKind) -> (PathBuf, Prepared, Man) {
+        let staging = tmp("stage");
+        let path = root.to_string_lossy().into_owned();
+        let paths = vec![path];
+        let p = FilesParams {
+            paths: &paths,
+            user: None,
+            password: None,
+            include: &[],
+            exclude: &[],
+            requested: kind,
+            full_every: 0,
+        };
+        let prepared = prepare(&p, state, &staging).unwrap();
+        let man: Man = serde_json::from_slice(&std::fs::read(staging.join("manifest.json")).unwrap()).unwrap();
+        (staging, prepared, man)
+    }
+
+    fn has_suffix(keys: &[String], suffix: &str) -> bool {
+        keys.iter().any(|k| k.ends_with(suffix))
+    }
+
+    /// (а) занятый файл из базы — в failed, не в deleted; (б) удалённый — в deleted;
+    /// (в) после разблокировки файл попадает в следующую копию.
+    #[cfg(windows)]
+    #[test]
+    fn locked_file_is_not_deleted_and_copied_later() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let src = tmp("src");
+        let busy = src.join("busy.txt");
+        let gone = src.join("gone.txt");
+        std::fs::write(&busy, b"busy").unwrap();
+        std::fs::write(&gone, b"gone").unwrap();
+
+        let (_, first, _) = prepare_at(&src, &JobState::default(), BackupKind::Full);
+        let state = first.new_state.expect("состояние");
+
+        std::fs::remove_file(&gone).unwrap();
+        // Штамп должен отличаться от базы, иначе файл не читают и ошибка не возникает.
+        std::fs::write(&busy, b"busy-changed").unwrap();
+        // share_mode(0): чужое чтение (std::fs::copy) получает ERROR_SHARING_VIOLATION.
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&busy).unwrap();
+        let (_, second, man) = prepare_at(&src, &state, BackupKind::Incremental);
+        assert!(has_suffix(&man.failed, "/busy.txt"), "failed: {:?}", man.failed);
+        assert!(!has_suffix(&man.deleted, "/busy.txt"), "deleted: {:?}", man.deleted);
+        assert!(has_suffix(&man.deleted, "/gone.txt"), "deleted: {:?}", man.deleted);
+        drop(lock);
+
+        let state = second.new_state.expect("состояние");
+        let (_, _, man) = prepare_at(&src, &state, BackupKind::Incremental);
+        assert!(has_suffix(&man.copied, "/busy.txt"), "copied: {:?}", man.copied);
+        assert!(!has_suffix(&man.deleted, "/busy.txt"), "deleted: {:?}", man.deleted);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// Каталог, который не удалось прочитать, не превращает свои файлы в deleted.
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_dir_is_not_deleted() {
+        let src = tmp("src");
+        let sub = src.join("locked");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("secret.txt"), b"s").unwrap();
+        std::fs::write(src.join("keep.txt"), b"k").unwrap();
+
+        let (_, first, _) = prepare_at(&src, &JobState::default(), BackupKind::Full);
+        let state = first.new_state.expect("состояние");
+
+        let user = std::env::var("USERNAME").unwrap();
+        let deny = std::process::Command::new("icacls")
+            .arg(&sub)
+            .arg("/deny")
+            .arg(format!("{user}:(OI)(CI)(RX)"))
+            .output()
+            .unwrap();
+        assert!(deny.status.success(), "icacls: {}", String::from_utf8_lossy(&deny.stderr));
+
+        let (_, _, man) = prepare_at(&src, &state, BackupKind::Incremental);
+        let _ = std::process::Command::new("icacls").arg(&sub).arg("/reset").output();
+        assert!(
+            !has_suffix(&man.deleted, "/secret.txt"),
+            "deleted: {:?}, warnings would miss a prefix",
+            man.deleted
+        );
+        assert!(!has_suffix(&man.deleted, "/keep.txt"), "deleted: {:?}", man.deleted);
+        let _ = std::fs::remove_dir_all(&src);
+    }
+}

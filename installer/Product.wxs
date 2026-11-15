@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="SteadyBackup" Language="1049" Codepage="1251" Version="0.1.8.0"
+           Manufacturer="SteadyBackup" UpgradeCode="8F4C2A1E-6B7D-4E9A-9C3F-2D5A8B1E7C40">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"
+             InstallPrivileges="elevated" Description="SteadyBackup 0.1.8" />
+
+    <!-- Same version is replaced: each build has a new ProductCode (Id="*"). -->
+    <MajorUpgrade Schedule="afterInstallValidate" AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="Уже установлена более новая версия SteadyBackup." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Icon in "Apps and features". The Start Menu shortcut takes its icon from steady-gui.exe. -->
+    <Icon Id="SteadyIcon.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="SteadyIcon.ico" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="SteadyBackup" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="SteadyBackup" />
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Title="SteadyBackup" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="cmpShortcut" />
+      <ComponentRef Id="cmpRun" />
+    </Feature>
+
+    <!-- Close the tray app so Qt DLLs are not locked. Failure is ignored: it may not be running. -->
+    <SetProperty Id="KillGui" Before="KillGui" Sequence="execute"
+                 Value="&quot;[SystemFolder]taskkill.exe&quot; /F /IM steady-gui.exe" />
+    <CustomAction Id="KillGui" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+                  Execute="deferred" Return="ignore" Impersonate="no" />
+
+    <!-- Stop a service left by a previous portable install before files are replaced.
+         [INSTALLFOLDER] already ends with a backslash; do not add another (WiX treats \ as escape). -->
+    <SetProperty Id="StopExisting" Before="StopExisting" Sequence="execute"
+                 Value="&quot;[INSTALLFOLDER]steady.exe&quot; uninstall" />
+    <CustomAction Id="StopExisting" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+                  Execute="deferred" Return="ignore" Impersonate="no" />
+
+    <!-- Service registration stays in steady.exe: ACL on ProgramData plus LocalSystem service.
+         WiX ServiceInstall would duplicate that and would not set the data-dir ACL. -->
+    <CustomAction Id="InstallService" FileKey="filSteadyExe" ExeCommand="install"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RollbackService" FileKey="filSteadyExe" ExeCommand="uninstall"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="UninstallService" FileKey="filSteadyExe" ExeCommand="uninstall"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="KillGui" Before="RemoveFiles" />
+      <Custom Action="StopExisting" Before="InstallFiles">NOT REMOVE</Custom>
+      <!-- Rollback must be sequenced before InstallService, so it is already in the
+           script if creating the service fails. -->
+      <Custom Action="RollbackService" Before="InstallService">NOT REMOVE</Custom>
+      <Custom Action="InstallService" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="UninstallService" Before="RemoveFiles">REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <!-- Shortcut lives in the all-users Start Menu, but the component itself must
+           stay in Program Files. A component rooted in ProgramMenuFolder is treated as
+           per-user and fails ICE38/ICE43/ICE57 when the key path is HKLM. -->
+      <Component Id="cmpShortcut" Guid="C3A91F20-7E4B-4D6A-8F12-9B0E6D4A2C11" Win64="yes">
+        <!-- Advertise="no": otherwise WiX turns the target into a feature shortcut whose
+             key path is the registry value, and the Start Menu item does not launch the GUI. -->
+        <Shortcut Id="StartMenuSteady" Directory="ApplicationProgramsFolder" Name="SteadyBackup"
+                  Description="SteadyBackup" Target="[INSTALLFOLDER]steady-gui.exe"
+                  WorkingDirectory="INSTALLFOLDER" Advertise="no" />
+        <RemoveFolder Id="RemoveAppPrograms" Directory="ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\SteadyBackup" Name="shortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="cmpRun" Guid="D4B02E31-8F5C-4E7B-9013-AC1F7E5B3D22" Win64="yes">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+                       Name="SteadyBackup" Type="string"
+                       Value="&quot;[INSTALLFOLDER]steady-gui.exe&quot; --tray" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Product>
+</Wix>

@@ -1,0 +1,6 @@
+target/
+build-gui/
+dist/
+*.log
+*.log.*.gz
+build-logs/

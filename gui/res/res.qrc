@@ -1,0 +1,8 @@
+<RCC>
+  <qresource prefix="/res">
+    <file>chevron-down-light.svg</file>
+    <file>chevron-up-light.svg</file>
+    <file>chevron-down-dark.svg</file>
+    <file>chevron-up-dark.svg</file>
+  </qresource>
+</RCC>

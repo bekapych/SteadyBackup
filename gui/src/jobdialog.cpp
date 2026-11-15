@@ -1,0 +1,1053 @@
+#include "jobdialog.h"
+
+#include "connectionpicker.h"
+#include "destinationdialog.h"
+#include "groupdialog.h"
+#include "serviceclient.h"
+#include "theme.h"
+#include "util.h"
+
+#include <QApplication>
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDateTimeEdit>
+#include <QDialogButtonBox>
+#include <QFileDialog>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QInputDialog>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QMessageBox>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QRegularExpression>
+#include <QSpinBox>
+#include <QStackedWidget>
+#include <QTabWidget>
+#include <QTimeEdit>
+#include <QUuid>
+#include <QVBoxLayout>
+
+static const char *kDays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+
+JobDialog::JobDialog(ServiceClient *client, const QJsonObject &job, QWidget *parent)
+    : QDialog(parent), m_client(client), m_original(job) {
+    setWindowTitle(job.isEmpty() ? tr("Новое задание") : tr("Задание: %1").arg(job.value("name").toString()));
+    resize(720, 600);
+
+    m_name = new QLineEdit;
+    m_enabled = new QCheckBox(tr("Включено"));
+    m_enabled->setChecked(true);
+
+    auto *head = new QHBoxLayout;
+    head->addWidget(new QLabel(tr("Имя:")));
+    head->addWidget(m_name, 1);
+    head->addWidget(m_enabled);
+
+    auto *tabs = m_tabs = new QTabWidget;
+    tabs->addTab(buildSourcePage(), tr("Источник"));
+    tabs->addTab(buildDestinationsPage(), tr("Назначения"));
+    tabs->addTab(buildArchivePage(), tr("Архив и хранение"));
+    tabs->addTab(buildSchedulePage(), tr("Расписание"));
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Сохранить"));
+    buttons->button(QDialogButtonBox::Ok)->setObjectName(QStringLiteral("primary"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(tr("Отмена"));
+    connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+    auto *v = new QVBoxLayout(this);
+    v->addLayout(head);
+    v->addWidget(tabs, 1);
+    v->addWidget(buttons);
+
+    load(job);
+    // На низком разрешении форма выше экрана: кнопки остаются внизу, поля прокручиваются.
+    util::keepButtonsOnScreen(this);
+}
+
+// ---------------- Источник ----------------
+
+QWidget *JobDialog::buildSourcePage() {
+    auto *page = new QWidget;
+    m_srcType = new QComboBox;
+    m_srcType->addItem(tr("Файлы и папки (локальные, сетевые, WebDAV)"), "files");
+    m_srcType->addItem(tr("Файловая база 1С"), "one_c");
+    m_srcType->addItem(tr("База MS SQL Server"), "ms_sql");
+    m_srcType->addItem(tr("База Firebird"), "firebird");
+    m_srcType->addItem(tr("Базы PostgreSQL"), "postgresql");
+    m_srcType->addItem(tr("Виртуальная машина Hyper-V"), "hyper_v");
+    m_srcPages = new QStackedWidget;
+
+    { // files
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        m_filesPaths = new QPlainTextEdit;
+        m_filesPaths->setMinimumHeight(64);
+        m_filesPaths->setMaximumHeight(140);
+        m_filesPaths->setPlaceholderText(tr("По одному пути на строку:\nD:\\Документы\n\\\\server\\share\\Проекты\n"
+                                            "https://cloud.example.ru/remote.php/dav/files/user/Work"));
+        auto *add = new QPushButton(tr("Добавить папку…"));
+        connect(add, &QPushButton::clicked, this, [this] {
+            const QString p = QFileDialog::getExistingDirectory(this);
+            if (!p.isEmpty()) m_filesPaths->appendPlainText(QDir::toNativeSeparators(p));
+        });
+        m_filesKind = new QComboBox;
+        m_filesKind->addItem(tr("Полная"), "full");
+        m_filesKind->addItem(tr("Инкрементная (изменения с прошлой копии)"), "incremental");
+        m_filesKind->addItem(tr("Дифференциальная (изменения с последней полной)"), "differential");
+        m_filesFullEvery = new QSpinBox;
+        m_filesFullEvery->setRange(0, 1000);
+        m_filesFullEvery->setSpecialValueText(tr("никогда"));
+        m_filesFullEvery->setSuffix(tr(" копий"));
+        // Для полной копии счётчик «полная каждые» не имеет смысла.
+        connect(m_filesKind, &QComboBox::currentIndexChanged, this,
+                [this] { m_filesFullEvery->setEnabled(m_filesKind->currentData().toString() != QLatin1String("full")); });
+        m_filesFullEvery->setEnabled(false);
+        m_filesInclude = new QLineEdit;
+        m_filesInclude->setPlaceholderText(tr("все файлы; или напр. *.docx; *.xlsx"));
+        m_filesExclude = new QLineEdit;
+        m_filesExclude->setPlaceholderText(QStringLiteral("*.tmp; ~$*; **/node_modules/**"));
+        m_filesConn = new ConnectionPicker(m_client, "web_dav", tr("без учётных данных"));
+        f->addRow(tr("Пути:"), m_filesPaths);
+        f->addRow(QString(), add);
+        f->addRow(tr("Тип копии:"), m_filesKind);
+        f->addRow(tr("Полная каждые:"), m_filesFullEvery);
+        f->addRow(tr("Включать:"), m_filesInclude);
+        f->addRow(tr("Исключать:"), m_filesExclude);
+        f->addRow(tr("Вход WebDAV:"), m_filesConn);
+        m_srcPages->addWidget(w);
+    }
+    { // 1C
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        m_onecPath = new QLineEdit;
+        m_onecPath->setPlaceholderText(QStringLiteral("C:\\1C\\Бухгалтерия"));
+        auto *browse = new QPushButton(tr("Обзор…"));
+        connect(browse, &QPushButton::clicked, this, [this] {
+            const QString p = QFileDialog::getExistingDirectory(this, tr("Каталог базы (где лежит 1Cv8.1CD)"), m_onecPath->text());
+            if (!p.isEmpty()) m_onecPath->setText(QDir::toNativeSeparators(p));
+        });
+        auto *pw = new QWidget;
+        auto *pl = new QHBoxLayout(pw);
+        pl->setContentsMargins(0, 0, 0, 0);
+        pl->addWidget(m_onecPath);
+        pl->addWidget(browse);
+        m_onecMode = new QComboBox;
+        m_onecMode->addItem(tr("Выгрузка .dt средствами платформы (рекомендуется)"), "dump_dt");
+        m_onecMode->addItem(tr("Копия файла 1Cv8.1CD"), "copy_file");
+        m_onecConn = new ConnectionPicker(m_client, "one_c", tr("без пароля (пользователь по умолчанию)"));
+        m_onecExe = new QLineEdit;
+        m_onecExe->setPlaceholderText(tr("автоматически"));
+        m_client->call({{"cmd", "find1c"}}, [this](bool ok, const QJsonValue &r, const QString &) {
+            if (ok && r.isString()) m_onecExe->setPlaceholderText(tr("автоматически: %1").arg(r.toString()));
+        }, this);
+        m_onecUnlock = new QLineEdit;
+        m_onecUnlock->setPlaceholderText(tr("если включена блокировка сеансов"));
+        f->addRow(tr("Каталог базы:"), pw);
+        f->addRow(tr("Способ:"), m_onecMode);
+        f->addRow(tr("Пользователь 1С:"), m_onecConn);
+        f->addRow(tr("1cv8.exe:"), m_onecExe);
+        f->addRow(tr("Код разрешения (/UC):"), m_onecUnlock);
+        auto *hint = new QLabel(tr("Выгрузка .dt выполняется в режиме Конфигуратора. В это время в базе не должно быть "
+                                   "активных пользователей, иначе выгрузка завершится ошибкой."));
+        hint->setWordWrap(true);
+        theme::markHint(hint);
+        f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+    { // MSSQL
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        m_sqlConn = new ConnectionPicker(m_client, "ms_sql", QString());
+        // Список приходит от службы; имя можно добавить и вручную (база ещё не создана, сервер недоступен).
+        m_sqlDatabases = new QListWidget;
+        m_sqlDatabases->setMinimumHeight(80);
+        m_sqlDatabases->setMaximumHeight(160);
+        m_sqlDatabases->setToolTip(tr("Отметьте нужные базы. Ничего не отмечено — копируются все пользовательские "
+                                      "базы сервера (без master, model, msdb, tempdb)."));
+        connect(m_sqlConn, &ConnectionPicker::changed, this, [this] { loadDatabases("ms_sql", true); });
+        QWidget *sqlButtons = dbButtons(m_sqlDatabases, "ms_sql");
+        m_sqlArchives = makeArchiveMode();
+        m_sqlStatus = new QLabel;
+        m_sqlStatus->setWordWrap(true);
+        m_sqlKind = new QComboBox;
+        m_sqlKind->addItem(tr("Полная"), "full");
+        m_sqlKind->addItem(tr("Дифференциальная"), "differential");
+        m_sqlKind->addItem(tr("Журнал транзакций"), "log");
+        m_sqlDir = new QLineEdit;
+        m_sqlDir->setPlaceholderText(QStringLiteral("C:\\MSSQL\\Backup  или  \\\\SQL01\\Backup$"));
+        m_sqlVerify = new QCheckBox(tr("Проверять копию (RESTORE VERIFYONLY)"));
+        m_sqlVerify->setChecked(true);
+        f->addRow(tr("Сервер:"), m_sqlConn);
+        f->addRow(tr("Базы:"), m_sqlDatabases);
+        f->addRow(QString(), sqlButtons);
+        f->addRow(QString(), m_sqlStatus);
+        f->addRow(tr("Архивы:"), m_sqlArchives);
+        f->addRow(tr("Тип копии:"), m_sqlKind);
+        f->addRow(tr("Папка для .bak:"), m_sqlDir);
+        f->addRow(m_sqlVerify);
+        auto *hint = new QLabel(tr("SQL Server должен иметь право записи в папку для .bak, а служба SteadyBackup — "
+                                   "право чтения. Для журнала транзакций нужна модель восстановления FULL (при выборе "
+                                   "«все базы» базы с моделью SIMPLE пропускаются). Если одна база не сохранилась, "
+                                   "остальные всё равно отправляются, а задание завершается ошибкой."));
+        hint->setWordWrap(true);
+        theme::markHint(hint);
+        f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+    { // Firebird
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        m_fbGbak = new QLineEdit;
+        m_fbGbak->setPlaceholderText(QStringLiteral("C:\\Program Files (x86)\\Firebird\\Firebird_3_0\\gbak.exe"));
+        auto *browse = new QPushButton(tr("Обзор…"));
+        connect(browse, &QPushButton::clicked, this, [this] {
+            const QString p = QFileDialog::getOpenFileName(this, tr("gbak.exe"), m_fbGbak->text(), tr("Программы (*.exe)"));
+            if (!p.isEmpty()) m_fbGbak->setText(QDir::toNativeSeparators(p));
+        });
+        auto *gb = new QWidget;
+        auto *gl = new QHBoxLayout(gb);
+        gl->setContentsMargins(0, 0, 0, 0);
+        gl->addWidget(m_fbGbak, 1);
+        gl->addWidget(browse);
+        m_fbConn = new ConnectionPicker(m_client, "firebird", tr("не выбрано"));
+        m_fbDatabases = new QPlainTextEdit;
+        m_fbDatabases->setMinimumHeight(64);
+        m_fbDatabases->setMaximumHeight(120);
+        m_fbDatabases->setPlaceholderText(tr("По одной базе на строку:\nlocalhost:E:\\Shop\\STANDART.FDB"));
+        m_fbNamesFrom = new QLineEdit;
+        m_fbNamesFrom->setPlaceholderText(tr("необязательно: папка, чьи подпапки — имена баз"));
+        m_fbTemplate = new QLineEdit;
+        m_fbTemplate->setPlaceholderText(QStringLiteral("E:\\{name}\\STANDART.FDB"));
+        m_fbHost = new QLineEdit;
+        m_fbHost->setPlaceholderText(QStringLiteral("localhost"));
+        m_fbVerify = new QCheckBox(tr("Проверять копию восстановлением (gbak -c) и удалять временную базу"));
+        m_fbVerify->setChecked(true);
+        f->addRow(tr("gbak.exe:"), gb);
+        f->addRow(tr("Пользователь:"), m_fbConn);
+        f->addRow(tr("Базы:"), m_fbDatabases);
+        f->addRow(tr("Папка имён:"), m_fbNamesFrom);
+        f->addRow(tr("Шаблон пути:"), m_fbTemplate);
+        f->addRow(tr("Сервер:"), m_fbHost);
+        f->addRow(m_fbVerify);
+        auto *hint = new QLabel(tr("Версия gbak должна совпадать с сервером: Firebird 1.5 и 3.0 — разные задания. "
+                                   "В архив попадает файл .fbk, не восстановленная база. Пароль gbak не виден в командной строке. "
+                                   "Выгрузку на WebDAV добавьте назначением, а не отдельной командой."));
+        hint->setWordWrap(true);
+        theme::markHint(hint);
+        f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+    { // PostgreSQL
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        m_pgConn = new ConnectionPicker(m_client, "postgresql", tr("не выбрано"));
+        m_pgDatabases = new QListWidget;
+        m_pgDatabases->setMinimumHeight(80);
+        m_pgDatabases->setMaximumHeight(160);
+        m_pgDatabases->setToolTip(tr("Отметьте нужные базы. Ничего не отмечено — копируются все базы сервера."));
+        connect(m_pgConn, &ConnectionPicker::changed, this, [this] { loadDatabases("postgresql", true); });
+        QWidget *pgButtons = dbButtons(m_pgDatabases, "postgresql");
+        m_pgArchives = makeArchiveMode();
+        m_pgStatus = new QLabel;
+        m_pgStatus->setWordWrap(true);
+        m_pgDump = new QLineEdit;
+        m_pgDump->setPlaceholderText(tr("автоматически: самая новая версия в Program Files\\PostgreSQL"));
+        auto *browse = new QPushButton(tr("Обзор…"));
+        connect(browse, &QPushButton::clicked, this, [this] {
+            const QString p = QFileDialog::getOpenFileName(this, tr("pg_dump.exe"), m_pgDump->text(), tr("Программы (*.exe)"));
+            if (!p.isEmpty()) m_pgDump->setText(QDir::toNativeSeparators(p));
+        });
+        auto *db = new QWidget;
+        auto *dl = new QHBoxLayout(db);
+        dl->setContentsMargins(0, 0, 0, 0);
+        dl->addWidget(m_pgDump, 1);
+        dl->addWidget(browse);
+        m_pgGlobals = new QCheckBox(tr("Сохранять роли и табличные пространства (pg_dumpall --globals-only)"));
+        m_pgVerify = new QCheckBox(tr("Проверять каждую копию (pg_restore --list)"));
+        m_pgVerify->setChecked(true);
+        f->addRow(tr("Сервер:"), m_pgConn);
+        f->addRow(tr("Базы:"), m_pgDatabases);
+        f->addRow(QString(), pgButtons);
+        f->addRow(QString(), m_pgStatus);
+        f->addRow(tr("Архивы:"), m_pgArchives);
+        f->addRow(tr("pg_dump.exe:"), db);
+        f->addRow(m_pgGlobals);
+        f->addRow(m_pgVerify);
+        auto *hint = new QLabel(tr("Отмеченные базы копируются; ничего не отмечено — все базы сервера, включая новые. "
+                                   "Каждая база сохраняется отдельным файлом .dump (формат pg_dump -Fc); восстановление — "
+                                   "pg_restore. Версия pg_dump должна быть не старше сервера. Пароль передаётся "
+                                   "через окружение и не виден в командной строке. Роли сохраняются только под "
+                                   "суперпользователем. Если одна база не сохранилась, остальные всё равно "
+                                   "отправляются, а задание завершается ошибкой."));
+        hint->setWordWrap(true);
+        theme::markHint(hint);
+        f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+    { // Hyper-V
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        m_vmName = new QComboBox;
+        m_vmName->setEditable(true);
+        m_client->call({{"cmd", "list_vms"}}, [this](bool ok, const QJsonValue &r, const QString &) {
+            if (!ok) return;
+            const QString cur = m_vmName->currentText();
+            for (const auto &v : r.toArray()) {
+                const QString n = v.toObject().value("Name").toString();
+                if (!n.isEmpty() && m_vmName->findText(n) < 0) m_vmName->addItem(n);
+            }
+            m_vmName->setCurrentText(cur);
+        }, this);
+        m_vmKind = new QComboBox;
+        m_vmKind->addItem(tr("Полная (весь диск каждый раз)"), "full");
+        m_vmKind->addItem(tr("Инкрементная (только изменённые блоки, RCT)"), "incremental");
+        m_vmFullEvery = new QSpinBox;
+        m_vmFullEvery->setRange(0, 1000);
+        m_vmFullEvery->setValue(7);
+        m_vmFullEvery->setSpecialValueText(tr("никогда"));
+        m_vmFullEvery->setSuffix(tr(" копий"));
+        connect(m_vmKind, &QComboBox::currentIndexChanged, this,
+                [this] { m_vmFullEvery->setEnabled(m_vmKind->currentData() == "incremental"); });
+        m_vmFullEvery->setEnabled(false);
+        m_vmConsistency = new QComboBox;
+        m_vmConsistency->addItem(tr("Согласованная (VSS внутри ВМ) — рекомендуется"), "application");
+        m_vmConsistency->addItem(tr("Аварийно-согласованная (без участия ВМ)"), "crash");
+        f->addRow(tr("Виртуальная машина:"), m_vmName);
+        f->addRow(tr("Тип копии:"), m_vmKind);
+        f->addRow(tr("Полная каждые:"), m_vmFullEvery);
+        f->addRow(tr("Согласованность:"), m_vmConsistency);
+        auto *hint = new QLabel(tr("Копия делается без остановки ВМ. Временная контрольная точка после копирования "
+                                   "сливается с диском — лишних .avhdx и контрольных точек не остаётся.\n"
+                                   "Согласованная копия требует служб интеграции Hyper-V в гостевой ОС; если они "
+                                   "недоступны, будет сделана аварийно-согласованная копия с предупреждением.\n"
+                                   "Восстановление цепочки: steady restore-vm <архивы> --target <папка>"));
+        theme::markHint(hint);
+        hint->setWordWrap(true);
+        f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+
+    connect(m_srcType, &QComboBox::currentIndexChanged, m_srcPages, &QStackedWidget::setCurrentIndex);
+    auto *v = new QVBoxLayout(page);
+    auto *f = new QFormLayout;
+    f->addRow(tr("Что копировать:"), m_srcType);
+    v->addLayout(f);
+    v->addWidget(m_srcPages, 1);
+    return page;
+}
+
+// ---------------- Назначения ----------------
+
+QWidget *JobDialog::buildDestinationsPage() {
+    auto *page = new QWidget;
+    m_destList = new QListWidget;
+    auto *add = new QPushButton(tr("Добавить…"));
+    auto *edit = new QPushButton(tr("Изменить…"));
+    auto *del = new QPushButton(tr("Удалить"));
+    auto editRow = [this](int row) {
+        if (row < 0 || row >= m_destinations.size()) return;
+        if (m_destinations.at(row).toObject().value("type") != "storage") {
+            QMessageBox::information(this, windowTitle(),
+                                     tr("Это назначение задано прямо в задании (старый формат). Чтобы изменить его, "
+                                        "откройте «Хранилища…» → «Перенести из заданий» или удалите и добавьте "
+                                        "назначение заново."));
+            return;
+        }
+        DestinationDialog dlg(m_client, m_destinations.at(row).toObject(), this);
+        dlg.prime(storagesForDialog());
+        if (dlg.exec() == QDialog::Accepted) {
+            m_destinations.replace(row, dlg.value());
+            refreshDestinations();
+        }
+    };
+    connect(add, &QPushButton::clicked, this, [this] {
+        DestinationDialog dlg(m_client, {}, this);
+        dlg.prime(storagesForDialog());
+        if (dlg.exec() == QDialog::Accepted) {
+            m_destinations.append(dlg.value());
+            refreshDestinations();
+        }
+    });
+    connect(edit, &QPushButton::clicked, this, [this, editRow] { editRow(m_destList->currentRow()); });
+    connect(m_destList, &QListWidget::itemDoubleClicked, this, [this, editRow] { editRow(m_destList->currentRow()); });
+    connect(del, &QPushButton::clicked, this, [this] {
+        const int r = m_destList->currentRow();
+        if (r >= 0) {
+            m_destinations.removeAt(r);
+            refreshDestinations();
+        }
+    });
+    auto *bl = new QVBoxLayout;
+    bl->addWidget(add);
+    bl->addWidget(edit);
+    bl->addWidget(del);
+    bl->addStretch();
+    auto *h = new QHBoxLayout(page);
+    h->addWidget(m_destList, 1);
+    h->addLayout(bl);
+    return page;
+}
+
+QJsonArray JobDialog::storagesForDialog() const {
+    QJsonArray all = m_storageList.isEmpty() ? util::storageCache() : m_storageList;
+    auto known = [&](const QString &id) {
+        if (id.isEmpty()) return;
+        for (const auto &s : all)
+            if (s.toObject().value("id").toString() == id) return;
+        const QString name = m_storageNames.value(id);
+        all.append(QJsonObject{{"id", id}, {"name", name.isEmpty() ? id : name}});
+    };
+    for (const auto &d : m_destinations) {
+        const QJsonObject o = d.toObject();
+        if (o.value("type").toString() == "storage") known(o.value("storage").toString());
+    }
+    return all;
+}
+
+void JobDialog::refreshDestinations() {
+    m_destList->clear();
+    for (const auto &d : std::as_const(m_destinations)) {
+        QJsonObject o = d.toObject();
+        if (o.value("type") == "storage") o["storage_name"] = m_storageNames.value(o.value("storage").toString());
+        QString text = util::destinationSummary(o);
+        if (d.toObject().value("type") != "storage") text += tr("  (задано в задании)");
+        m_destList->addItem(text);
+    }
+}
+
+// ---------------- Архив ----------------
+
+QWidget *JobDialog::buildArchivePage() {
+    auto *page = new QWidget;
+    auto *v = new QVBoxLayout(page);
+
+    auto *arc = new QGroupBox(tr("Упаковка 7-Zip"));
+    auto *f = new QFormLayout(arc);
+    m_arcEnabled = new QCheckBox(tr("Упаковывать в архив .7z"));
+    m_arcLevel = new QSpinBox;
+    m_arcLevel->setRange(0, 9);
+    m_arcPassword = new PasswordEdit;
+    m_arcHeaders = new QCheckBox(tr("Шифровать имена файлов"));
+    m_arcVolume = new QLineEdit;
+    m_arcVolume->setPlaceholderText(tr("не делить; напр. 4g или 700m"));
+    m_arcTest = new QCheckBox(tr("Проверять архив после упаковки"));
+    f->addRow(m_arcEnabled);
+    f->addRow(tr("Степень сжатия (0–9):"), m_arcLevel);
+    f->addRow(tr("Пароль (AES-256):"), m_arcPassword);
+    f->addRow(m_arcHeaders);
+    f->addRow(tr("Размер тома:"), m_arcVolume);
+    f->addRow(m_arcTest);
+    for (QWidget *w : std::initializer_list<QWidget *>{m_arcLevel, m_arcPassword, m_arcHeaders, m_arcVolume, m_arcTest})
+        connect(m_arcEnabled, &QCheckBox::toggled, w, &QWidget::setEnabled);
+
+    auto *ret = new QGroupBox(tr("Хранение копий"));
+    auto *rf = new QFormLayout(ret);
+    m_keepFull = new QSpinBox;
+    m_keepFull->setRange(0, 10000);
+    m_keepFull->setSpecialValueText(tr("хранить все"));
+    m_keepDays = new QSpinBox;
+    m_keepDays->setRange(0, 36500);
+    m_keepDays->setSpecialValueText(tr("не ограничивать"));
+    m_keepDays->setSuffix(tr(" дн."));
+    m_keepSets = new QSpinBox;
+    m_keepSets->setRange(0, 100000);
+    m_keepSets->setSpecialValueText(tr("не ограничивать"));
+    rf->addRow(tr("Хранить полных копий:"), m_keepFull);
+    rf->addRow(tr("Удалять наборы старше:"), m_keepDays);
+    rf->addRow(tr("Хранить наборов не больше:"), m_keepSets);
+    auto *hint = new QLabel(tr("Вместе с удаляемой полной копией удаляются и зависящие от неё "
+                               "инкрементные и дифференциальные копии. Срок и число наборов — для копий "
+                               "без своей полной (журнал и разностные MSSQL) и для хвоста старше сохранённой полной. "
+                               "Цепочку сохранённой полной они не удаляют."));
+    hint->setWordWrap(true);
+    theme::markHint(hint);
+    rf->addRow(hint);
+
+    v->addWidget(arc);
+    v->addWidget(ret);
+    v->addStretch();
+    return page;
+}
+
+// ---------------- Расписание ----------------
+
+QWidget *JobDialog::buildSchedulePage() {
+    auto *page = new QWidget;
+    m_schedType = new QComboBox;
+    m_schedType->addItem(tr("Только вручную"), "manual");
+    m_schedType->addItem(tr("Ежедневно"), "daily");
+    m_schedType->addItem(tr("По дням недели"), "weekly");
+    m_schedType->addItem(tr("Ежемесячно"), "monthly");
+    m_schedType->addItem(tr("С интервалом"), "interval");
+    m_schedType->addItem(tr("Однократно"), "once");
+
+    m_schedTimes = new QLineEdit(QStringLiteral("23:00"));
+    m_schedTimes->setPlaceholderText(QStringLiteral("23:00; 13:00"));
+    m_schedPages = new QStackedWidget;
+
+    m_schedPages->addWidget(new QWidget); // manual
+    m_schedPages->addWidget(new QWidget); // daily — только время
+    { // weekly
+        auto *w = new QWidget;
+        auto *h = new QHBoxLayout(w);
+        h->setContentsMargins(0, 0, 0, 0);
+        const QStringList names{tr("Пн"), tr("Вт"), tr("Ср"), tr("Чт"), tr("Пт"), tr("Сб"), tr("Вс")};
+        for (const auto &n : names) {
+            auto *cb = new QCheckBox(n);
+            m_weekDays << cb;
+            h->addWidget(cb);
+        }
+        h->addStretch();
+        m_schedPages->addWidget(w);
+    }
+    { // monthly
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        f->setContentsMargins(0, 0, 0, 0);
+        m_monthDays = new QLineEdit(QStringLiteral("1"));
+        m_monthDays->setPlaceholderText(tr("напр. 1; 15; 31 (31 = последний день месяца)"));
+        f->addRow(tr("Числа месяца:"), m_monthDays);
+        m_schedPages->addWidget(w);
+    }
+    { // interval
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        f->setContentsMargins(0, 0, 0, 0);
+        m_intervalMin = new QSpinBox;
+        m_intervalMin->setRange(1, 10080);
+        m_intervalMin->setValue(60);
+        m_intervalMin->setSuffix(tr(" мин"));
+        m_intervalWindow = new QCheckBox(tr("Только в интервале времени"));
+        m_intervalFrom = new QTimeEdit(QTime(8, 0));
+        m_intervalTo = new QTimeEdit(QTime(20, 0));
+        auto *hw = new QWidget;
+        auto *hl = new QHBoxLayout(hw);
+        hl->setContentsMargins(0, 0, 0, 0);
+        hl->addWidget(m_intervalWindow);
+        hl->addWidget(new QLabel(tr("с")));
+        hl->addWidget(m_intervalFrom);
+        hl->addWidget(new QLabel(tr("до")));
+        hl->addWidget(m_intervalTo);
+        hl->addStretch();
+        f->addRow(tr("Каждые:"), m_intervalMin);
+        f->addRow(hw);
+        m_schedPages->addWidget(w);
+    }
+    { // once
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        f->setContentsMargins(0, 0, 0, 0);
+        m_onceAt = new QDateTimeEdit(QDateTime::currentDateTime().addSecs(3600));
+        m_onceAt->setCalendarPopup(true);
+        m_onceAt->setDisplayFormat(QStringLiteral("dd.MM.yyyy HH:mm"));
+        f->addRow(tr("Дата и время:"), m_onceAt);
+        m_schedPages->addWidget(w);
+    }
+
+    auto *timesLabel = new QLabel(tr("Время запуска:"));
+    auto updateVisibility = [this, timesLabel](int i) {
+        m_schedPages->setCurrentIndex(i);
+        const QString t = m_schedType->itemData(i).toString();
+        const bool needTimes = t == "daily" || t == "weekly" || t == "monthly";
+        m_schedTimes->setVisible(needTimes);
+        timesLabel->setVisible(needTimes);
+    };
+    connect(m_schedType, &QComboBox::currentIndexChanged, this, updateVisibility);
+
+    m_runMissed = new QCheckBox(tr("Выполнять пропущенные запуски (если компьютер был выключен)"));
+    m_runMissed->setChecked(true);
+
+    // 0 — значение по умолчанию для типа источника (1С 3 ч, SQL 6 ч, файлы и Hyper-V 12 ч).
+    m_timeoutMin = new QSpinBox;
+    m_timeoutMin->setRange(0, 7 * 24 * 60);
+    m_timeoutMin->setSpecialValueText(tr("по умолчанию"));
+    m_timeoutMin->setSuffix(tr(" мин"));
+    m_timeoutMin->setToolTip(tr("Предельное время одного запуска внешней программы (1С, SQL, Hyper-V, 7-Zip). "
+                                "По истечении процесс завершается, задание — с ошибкой."));
+
+    // Список групп приходит от службы; ссылку из задания показываем сразу, чтобы сохранение
+    // до ответа не сняло задание с группы.
+    m_group = new SteadyCombo;
+    m_group->addItem(tr("без группы"), QString());
+    m_group->setToolTip(tr("По расписанию группы задание запускается вместе с остальными её заданиями. "
+                           "Собственное расписание задания тоже действует. Группы — в главном окне."));
+    m_client->call({{"cmd", "list_groups"}}, [this](bool ok, const QJsonValue &r, const QString &) {
+        if (!ok) return;
+        const QString cur = m_group->currentData().toString();
+        m_group->clear();
+        m_group->addItem(tr("без группы"), QString());
+        for (const auto &v : r.toArray()) {
+            const QJsonObject g = v.toObject();
+            m_group->addItem(g.value("name").toString(), g.value("id").toString());
+        }
+        const int i = m_group->findData(cur);
+        if (i >= 0) m_group->setCurrentIndex(i);
+        else if (!cur.isEmpty()) {
+            m_group->addItem(tr("группа удалена"), cur);
+            m_group->setCurrentIndex(m_group->count() - 1);
+        }
+    }, this);
+
+    auto *f = new QFormLayout;
+    f->addRow(tr("Запуск:"), m_schedType);
+    f->addRow(timesLabel, m_schedTimes);
+    f->addRow(tr("Группа:"), m_group);
+    f->addRow(tr("Прервать, если длится дольше:"), m_timeoutMin);
+    auto *v = new QVBoxLayout(page);
+    v->addLayout(f);
+    v->addWidget(m_schedPages);
+    v->addWidget(m_runMissed);
+    auto *retryBox = new QGroupBox(tr("При ошибке"));
+    auto *rl = new QVBoxLayout(retryBox);
+    m_retry = new RetryEditor(false);
+    rl->addWidget(m_retry);
+    auto *retryHint = new QLabel(tr("При запуске по расписанию группы действуют повторы группы, если они в ней заданы."));
+    retryHint->setWordWrap(true);
+    theme::markHint(retryHint);
+    rl->addWidget(retryHint);
+    v->addWidget(retryBox);
+    v->addStretch();
+    updateVisibility(0);
+    return page;
+}
+
+// ---------------- Загрузка / сохранение ----------------
+
+static QString joinArray(const QJsonValue &v, const QString &sep) {
+    QStringList l;
+    for (const auto &x : v.toArray())
+        l << (x.isDouble() ? QString::number(x.toInt()) : x.toString());
+    return l.join(sep);
+}
+
+static int indexOfData(QComboBox *c, const QString &d) {
+    return qMax(0, c->findData(d));
+}
+
+void JobDialog::load(const QJsonObject &job) {
+    m_name->setText(job.value("name").toString());
+    m_enabled->setChecked(job.value("enabled").toBool(true));
+
+    const QJsonObject s = job.value("source").toObject();
+    const QString st = s.value("type").toString("files");
+    m_srcType->setCurrentIndex(indexOfData(m_srcType, st));
+    m_srcPages->setCurrentIndex(m_srcType->currentIndex());
+    if (st == "files") {
+        m_filesPaths->setPlainText(joinArray(s.value("paths"), "\n"));
+        m_filesInclude->setText(joinArray(s.value("include"), "; "));
+        m_filesExclude->setText(joinArray(s.value("exclude"), "; "));
+        m_filesKind->setCurrentIndex(indexOfData(m_filesKind, s.value("kind").toString("full")));
+        m_filesFullEvery->setValue(s.value("full_every").toInt());
+        m_filesFullEvery->setEnabled(m_filesKind->currentData().toString() != QLatin1String("full"));
+        m_filesConn->setSource(s);
+    } else if (st == "one_c") {
+        m_onecPath->setText(s.value("ib_path").toString());
+        m_onecExe->setText(s.value("platform_exe").toString());
+        m_onecConn->setSource(s);
+        m_onecMode->setCurrentIndex(indexOfData(m_onecMode, s.value("mode").toString("dump_dt")));
+        m_onecUnlock->setText(s.value("unlock_code").toString());
+    } else if (st == "ms_sql") {
+        m_sqlConn->setSource(s);
+        QStringList dbs;
+        for (const auto &d : s.value("databases").toArray()) dbs << d.toString();
+        // Прежние задания хранят одну базу в "database".
+        if (dbs.isEmpty() && !s.value("database").toString().isEmpty()) dbs << s.value("database").toString();
+        setDbList(m_sqlDatabases, dbs, {});
+        m_sqlArchives->setCurrentIndex(s.value("separate_archives").toBool(false) ? 1 : 0);
+        m_sqlKind->setCurrentIndex(indexOfData(m_sqlKind, s.value("kind").toString("full")));
+        m_sqlDir->setText(s.value("backup_dir").toString());
+        m_sqlVerify->setChecked(s.value("verify").toBool(true));
+    } else if (st == "firebird") {
+        m_fbGbak->setText(s.value("gbak").toString());
+        m_fbConn->setSource(s);
+        m_fbDatabases->setPlainText(joinArray(s.value("databases"), "\n"));
+        m_fbNamesFrom->setText(s.value("names_from").toString());
+        m_fbTemplate->setText(s.value("path_template").toString());
+        m_fbHost->setText(s.value("host").toString());
+        m_fbVerify->setChecked(s.value("verify").toBool(true));
+    } else if (st == "postgresql") {
+        m_pgConn->setSource(s);
+        QStringList dbs;
+        for (const auto &d : s.value("databases").toArray()) dbs << d.toString();
+        setDbList(m_pgDatabases, dbs, {});
+        m_pgArchives->setCurrentIndex(s.value("separate_archives").toBool(false) ? 1 : 0);
+        m_pgDump->setText(s.value("pg_dump").toString());
+        m_pgGlobals->setChecked(s.value("globals").toBool(false));
+        m_pgVerify->setChecked(s.value("verify").toBool(true));
+    } else if (st == "hyper_v") {
+        m_vmName->setCurrentText(s.value("vm_name").toString());
+        m_vmKind->setCurrentIndex(indexOfData(m_vmKind, s.value("kind").toString("full")));
+        m_vmFullEvery->setValue(s.value("full_every").toInt(7));
+        m_vmFullEvery->setEnabled(m_vmKind->currentData() == "incremental");
+        m_vmConsistency->setCurrentIndex(indexOfData(m_vmConsistency, s.value("consistency").toString("application")));
+    }
+
+    m_destinations = job.value("destinations").toArray();
+    refreshDestinations();
+    m_client->call({{"cmd", "list_storages"}}, [this](bool ok, const QJsonValue &r, const QString &) {
+        if (!ok) return;
+        m_storageList = r.toArray();
+        util::setStorageCache(m_storageList);
+        m_storageNames.clear();
+        for (const auto &s : std::as_const(m_storageList))
+            m_storageNames.insert(s.toObject().value("id").toString(), s.toObject().value("name").toString());
+        refreshDestinations();
+    }, this);
+
+    const QJsonObject a = job.value("archive").toObject();
+    m_arcEnabled->setChecked(a.value("enabled").toBool(true));
+    m_arcLevel->setValue(a.value("level").toInt(5));
+    m_arcPassword->setStored(a.value("password").toString());
+    m_arcHeaders->setChecked(a.value("encrypt_headers").toBool(true));
+    m_arcVolume->setText(a.value("volume_size").toString());
+    m_arcTest->setChecked(a.value("test_after").toBool(true));
+    const QJsonObject ret = job.value("retention").toObject();
+    m_keepFull->setValue(ret.value("keep_full").toInt(0));
+    m_keepDays->setValue(ret.value("keep_days").toInt(0));
+    m_keepSets->setValue(ret.value("keep_sets").toInt(0));
+
+    const QJsonObject sc = job.value("schedule").toObject();
+    const QString t = sc.value("type").toString("manual");
+    m_schedType->setCurrentIndex(indexOfData(m_schedType, t));
+    if (sc.contains("times")) {
+        QStringList ts;
+        for (const auto &x : sc.value("times").toArray())
+            ts << x.toString().left(5);
+        m_schedTimes->setText(ts.join("; "));
+    }
+    if (t == "weekly")
+        for (const auto &d : sc.value("days").toArray())
+            for (int i = 0; i < 7; ++i)
+                if (d.toString() == QLatin1String(kDays[i])) m_weekDays[i]->setChecked(true);
+    if (t == "monthly") m_monthDays->setText(joinArray(sc.value("days"), "; "));
+    if (t == "interval") {
+        m_intervalMin->setValue(sc.value("minutes").toInt(60));
+        const bool win = sc.value("from").isString() && sc.value("to").isString();
+        m_intervalWindow->setChecked(win);
+        if (win) {
+            m_intervalFrom->setTime(QTime::fromString(sc.value("from").toString().left(5), "HH:mm"));
+            m_intervalTo->setTime(QTime::fromString(sc.value("to").toString().left(5), "HH:mm"));
+        }
+    }
+    if (t == "once") m_onceAt->setDateTime(QDateTime::fromString(sc.value("at").toString().left(19), Qt::ISODate));
+    m_runMissed->setChecked(job.value("run_missed").toBool(true));
+    m_timeoutMin->setValue(job.value("timeout_minutes").toInt(0));
+    m_retry->load(job);
+    const QString group = job.value("group").toString();
+    if (!group.isEmpty()) {
+        int i = m_group->findData(group);
+        if (i < 0) {
+            m_group->addItem(tr("группа (загрузка…)"), group);
+            i = m_group->count() - 1;
+        }
+        m_group->setCurrentIndex(i);
+    }
+}
+
+static QJsonArray toArray(const QStringList &l) {
+    QJsonArray a;
+    for (const auto &s : l)
+        a.append(s);
+    return a;
+}
+
+static QJsonArray parseTimes(const QString &text) {
+    QJsonArray a;
+    for (const auto &s : util::splitList(text)) {
+        const QTime t = QTime::fromString(s, s.count(':') == 2 ? "H:mm:ss" : "H:mm");
+        if (t.isValid()) a.append(t.toString("HH:mm:ss"));
+    }
+    return a;
+}
+
+QJsonObject JobDialog::value() const {
+    using util::optString;
+    QJsonObject job = m_original;
+    if (!job.contains("id")) job["id"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    job["name"] = m_name->text().trimmed();
+    job["enabled"] = m_enabled->isChecked();
+
+    const QString st = m_srcType->currentData().toString();
+    // Поля исходного задания сохраняем, пока тип источника не меняли: так не теряются
+    // учётные данные и поля, которых нет в этой версии окна.
+    QJsonObject s = m_original.value("source").toObject();
+    if (s.value("type").toString() != st) s = QJsonObject{};
+    s["type"] = st;
+    if (st == "files") {
+        QStringList paths;
+        for (const auto &p : m_filesPaths->toPlainText().split('\n', Qt::SkipEmptyParts))
+            if (!p.trimmed().isEmpty()) paths << p.trimmed();
+        s["paths"] = toArray(paths);
+        s["include"] = toArray(util::splitList(m_filesInclude->text()));
+        s["exclude"] = toArray(util::splitList(m_filesExclude->text()));
+        s["kind"] = m_filesKind->currentData().toString();
+        s["full_every"] = m_filesFullEvery->value();
+        m_filesConn->apply(s);
+    } else if (st == "one_c") {
+        s["ib_path"] = m_onecPath->text().trimmed();
+        s["platform_exe"] = optString(m_onecExe->text());
+        m_onecConn->apply(s);
+        s["mode"] = m_onecMode->currentData().toString();
+        s["unlock_code"] = optString(m_onecUnlock->text());
+    } else if (st == "ms_sql") {
+        m_sqlConn->apply(s);
+        const QStringList dbs = dbChecked(m_sqlDatabases);
+        // Одна база пишется и в прежнее поле: такое задание прочтёт и старая версия службы.
+        s["database"] = dbs.size() == 1 ? dbs.first() : QString();
+        s["databases"] = toArray(dbs);
+        s["separate_archives"] = m_sqlArchives->currentData().toBool();
+        s["kind"] = m_sqlKind->currentData().toString();
+        s["backup_dir"] = m_sqlDir->text().trimmed();
+        s["verify"] = m_sqlVerify->isChecked();
+    } else if (st == "firebird") {
+        s["gbak"] = m_fbGbak->text().trimmed();
+        m_fbConn->apply(s);
+        QStringList dbs;
+        for (const auto &p : m_fbDatabases->toPlainText().split('\n', Qt::SkipEmptyParts))
+            if (!p.trimmed().isEmpty()) dbs << p.trimmed();
+        s["databases"] = toArray(dbs);
+        s["names_from"] = optString(m_fbNamesFrom->text());
+        s["path_template"] = optString(m_fbTemplate->text());
+        s["host"] = optString(m_fbHost->text());
+        s["verify"] = m_fbVerify->isChecked();
+    } else if (st == "postgresql") {
+        m_pgConn->apply(s);
+        s["databases"] = toArray(dbChecked(m_pgDatabases));
+        s["separate_archives"] = m_pgArchives->currentData().toBool();
+        s["pg_dump"] = optString(m_pgDump->text());
+        s["globals"] = m_pgGlobals->isChecked();
+        s["verify"] = m_pgVerify->isChecked();
+    } else if (st == "hyper_v") {
+        s["vm_name"] = m_vmName->currentText().trimmed();
+        s["kind"] = m_vmKind->currentData().toString();
+        s["full_every"] = m_vmFullEvery->value();
+        s["consistency"] = m_vmConsistency->currentData().toString();
+    }
+    job["source"] = s;
+    job["destinations"] = m_destinations;
+
+    job["archive"] = QJsonObject{
+        {"enabled", m_arcEnabled->isChecked()},
+        {"level", m_arcLevel->value()},
+        {"password", m_arcPassword->value()},
+        {"encrypt_headers", m_arcHeaders->isChecked()},
+        {"volume_size", optString(m_arcVolume->text())},
+        {"test_after", m_arcTest->isChecked()},
+    };
+    job["retention"] = QJsonObject{
+        {"keep_full", m_keepFull->value()},
+        {"keep_days", m_keepDays->value()},
+        {"keep_sets", m_keepSets->value()},
+    };
+
+    const QString t = m_schedType->currentData().toString();
+    QJsonObject sc{{"type", t}};
+    if (t == "daily" || t == "weekly" || t == "monthly") sc["times"] = parseTimes(m_schedTimes->text());
+    if (t == "weekly") {
+        QJsonArray d;
+        for (int i = 0; i < 7; ++i)
+            if (m_weekDays[i]->isChecked()) d.append(QLatin1String(kDays[i]));
+        sc["days"] = d;
+    }
+    if (t == "monthly") {
+        QJsonArray d;
+        for (const auto &x : util::splitList(m_monthDays->text())) {
+            const int n = x.toInt();
+            if (n >= 1 && n <= 31) d.append(n);
+        }
+        sc["days"] = d;
+    }
+    if (t == "interval") {
+        sc["minutes"] = m_intervalMin->value();
+        if (m_intervalWindow->isChecked()) {
+            sc["from"] = m_intervalFrom->time().toString("HH:mm:ss");
+            sc["to"] = m_intervalTo->time().toString("HH:mm:ss");
+        }
+    }
+    if (t == "once") sc["at"] = m_onceAt->dateTime().toString("yyyy-MM-ddTHH:mm:ss");
+    job["schedule"] = sc;
+    job["run_missed"] = m_runMissed->isChecked();
+    m_retry->store(job);
+    if (m_timeoutMin->value() > 0)
+        job["timeout_minutes"] = m_timeoutMin->value();
+    else
+        job.remove(QStringLiteral("timeout_minutes"));
+    const QString group = m_group->currentData().toString();
+    if (group.isEmpty())
+        job.remove(QStringLiteral("group"));
+    else
+        job["group"] = group;
+    return job;
+}
+
+QString JobDialog::validate(int *tab) const {
+    auto at = [tab](int index, const QString &text) {
+        if (tab) *tab = index;
+        return text;
+    };
+    const QJsonObject j = value();
+    if (j.value("name").toString().isEmpty()) return at(-1, tr("Укажите имя задания."));
+    const QJsonObject s = j.value("source").toObject();
+    const QString st = s.value("type").toString();
+    if (st == "files" && s.value("paths").toArray().isEmpty()) return at(0, tr("Укажите хотя бы одну папку-источник."));
+    if (st == "one_c" && s.value("ib_path").toString().isEmpty()) return at(0, tr("Укажите каталог базы 1С."));
+    if (st == "ms_sql" && ((s.value("server").toString().isEmpty() && s.value("connection").toString().isEmpty()) ||
+                           s.value("backup_dir").toString().isEmpty()))
+        return at(0, tr("Укажите сервер и папку для .bak."));
+    if (st == "firebird" && (s.value("gbak").toString().isEmpty() ||
+                             (s.value("databases").toArray().isEmpty() && s.value("names_from").toString().isEmpty())))
+        return at(0, tr("Укажите gbak.exe и хотя бы одну базу или папку имён."));
+    if (st == "firebird" && s.value("connection").toString().isEmpty() && s.value("user").toString().isEmpty())
+        return at(0, tr("Выберите подключение Firebird. Если списка нет — «Подключения…», тип «Firebird (SYSDBA)»."));
+    if (st == "postgresql" && s.value("connection").toString().isEmpty() && s.value("user").toString().isEmpty() &&
+        s.value("host").toString().isEmpty())
+        return at(0, tr("Выберите подключение PostgreSQL. Если списка нет — «Подключения…», тип «PostgreSQL»."));
+    if (st == "hyper_v" && s.value("vm_name").toString().isEmpty()) return at(0, tr("Укажите имя виртуальной машины."));
+    if (j.value("destinations").toArray().isEmpty()) return at(1, tr("Добавьте хотя бы одно назначение."));
+    const QJsonObject sc = j.value("schedule").toObject();
+    const QString t = sc.value("type").toString();
+    if ((t == "daily" || t == "weekly" || t == "monthly") && sc.value("times").toArray().isEmpty())
+        return at(3, tr("Укажите время запуска в формате ЧЧ:ММ."));
+    if (t == "weekly" && sc.value("days").toArray().isEmpty()) return at(3, tr("Отметьте дни недели."));
+    if (t == "monthly" && sc.value("days").toArray().isEmpty()) return at(3, tr("Укажите числа месяца."));
+    return {};
+}
+
+// ---------------- Список баз ----------------
+
+QStringList JobDialog::dbChecked(const QListWidget *list) {
+    QStringList l;
+    for (int i = 0; i < list->count(); ++i)
+        if (list->item(i)->checkState() == Qt::Checked) l << list->item(i)->text();
+    return l;
+}
+
+void JobDialog::setDbList(QListWidget *list, const QStringList &checked, const QStringList &available) {
+    QStringList all = available;
+    // Отмеченные базы, которых нет на сервере (удалена, переименована), не теряем: их видно и можно снять.
+    for (const auto &c : checked)
+        if (!all.contains(c)) all << c;
+    list->clear();
+    for (const auto &n : std::as_const(all)) {
+        auto *it = new QListWidgetItem(n, list);
+        it->setFlags(it->flags() | Qt::ItemIsUserCheckable);
+        it->setCheckState(checked.contains(n) ? Qt::Checked : Qt::Unchecked);
+        if (!available.isEmpty() && !available.contains(n)) it->setToolTip(tr("нет на сервере"));
+    }
+}
+
+QWidget *JobDialog::dbButtons(QListWidget *list, const QString &type) {
+    auto *refresh = new QPushButton(tr("Проверить и обновить"));
+    connect(refresh, &QPushButton::clicked, this, [this, type] { loadDatabases(type, false); });
+    auto *add = new QPushButton(tr("Добавить вручную…"));
+    connect(add, &QPushButton::clicked, this, [this, list] {
+        bool ok = false;
+        const QString n =
+            QInputDialog::getText(this, tr("База данных"), tr("Имя базы:"), QLineEdit::Normal, {}, &ok).trimmed();
+        if (!ok || n.isEmpty()) return;
+        QStringList checked = dbChecked(list);
+        if (!checked.contains(n)) checked << n;
+        QStringList all;
+        for (int i = 0; i < list->count(); ++i) all << list->item(i)->text();
+        setDbList(list, checked, all);
+    });
+    auto *toggle = new QPushButton(tr("Отметить все / снять"));
+    toggle->setToolTip(tr("Ничего не отмечено — копируются все базы сервера, включая новые."));
+    connect(toggle, &QPushButton::clicked, this, [list] {
+        const bool anyUnchecked = [&] {
+            for (int i = 0; i < list->count(); ++i)
+                if (list->item(i)->checkState() != Qt::Checked) return true;
+            return false;
+        }();
+        for (int i = 0; i < list->count(); ++i)
+            list->item(i)->setCheckState(anyUnchecked ? Qt::Checked : Qt::Unchecked);
+    });
+    auto *w = new QWidget;
+    auto *l = new QHBoxLayout(w);
+    l->setContentsMargins(0, 0, 0, 0);
+    l->addWidget(refresh);
+    l->addWidget(add);
+    l->addWidget(toggle);
+    l->addStretch();
+    return w;
+}
+
+QComboBox *JobDialog::makeArchiveMode() {
+    auto *c = new QComboBox;
+    c->addItem(tr("Все базы в одном архиве"), false);
+    c->addItem(tr("Каждая база в отдельном архиве"), true);
+    c->setToolTip(tr("Отдельные архивы называются <задание>_<дата>_<время>_<вид>.<база>.7z; удобно восстанавливать "
+                     "одну базу. Ротация удаляет архивы одного запуска вместе."));
+    return c;
+}
+
+void JobDialog::loadDatabases(const QString &type, bool automatic) {
+    const bool sql = type == QLatin1String("ms_sql");
+    QLabel *status = sql ? m_sqlStatus : m_pgStatus;
+    // Источник из текущего состояния формы: служба сама подставит учётные данные подключения.
+    QJsonObject s = value().value("source").toObject();
+    if (s.value("type").toString() != type) return;
+    const bool hasConn = !s.value("connection").toString().isEmpty();
+    const bool hasInline = !s.value(sql ? "server" : "host").toString().isEmpty();
+    if (!hasConn && !hasInline) {
+        if (!automatic) {
+            status->setText(tr("Выберите подключение."));
+            theme::setState(status, theme::Warn);
+        }
+        return;
+    }
+    const int seq = ++m_dbSeq;
+    status->setText(tr("Подключение к серверу…"));
+    theme::setState(status, theme::Muted);
+    m_client->call({{"cmd", "list_databases"}, {"source", s}},
+                   [this, sql, status, seq](bool ok, const QJsonValue &r, const QString &err) {
+        if (seq != m_dbSeq) return;
+        if (!ok) {
+            status->setText(tr("Ошибка подключения: %1").arg(err));
+            theme::setState(status, theme::Error);
+            return;
+        }
+        QStringList names;
+        for (const auto &v : r.toArray()) names << v.toString();
+        QListWidget *list = sql ? m_sqlDatabases : m_pgDatabases;
+        setDbList(list, dbChecked(list), names);
+        QStringList missing;
+        for (const auto &c : dbChecked(list))
+            if (!names.contains(c)) missing << c;
+        if (!missing.isEmpty()) {
+            status->setText(tr("Подключение работает, но на сервере нет баз: %1.").arg(missing.join(", ")));
+            theme::setState(status, theme::Warn);
+            return;
+        }
+        status->setText(tr("Подключение работает, баз на сервере: %1.").arg(names.size()));
+        theme::setState(status, theme::Ok);
+    }, this);
+}
+
+void JobDialog::saveShots(const QString &dir, const QString &prefix) {
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        m_tabs->setCurrentIndex(i);
+        QApplication::processEvents();
+        grab().save(QStringLiteral("%1/%2-%3.png").arg(dir, prefix).arg(i + 1));
+    }
+    m_tabs->setCurrentIndex(0);
+}
+
+void JobDialog::accept() {
+    int tab = -1;
+    const QString err = validate(&tab);
+    if (!err.isEmpty()) {
+        // Показываем вкладку, где не хватает данных: иначе сообщение есть, а поля не видно.
+        if (tab >= 0) m_tabs->setCurrentIndex(tab);
+        else m_name->setFocus();
+        QMessageBox::warning(this, windowTitle(), err);
+        return;
+    }
+    QDialog::accept();
+}

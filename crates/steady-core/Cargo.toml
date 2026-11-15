@@ -1,0 +1,28 @@
+[package]
+name = "steady-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+globset.workspace = true
+tracing.workspace = true
+tokio = { version = "1", features = ["rt", "io-util", "fs", "net", "time"] }
+russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "3"
+ureq = { version = "3", features = ["json"] }
+base64 = "0.22"
+percent-encoding = "2"
+rand = "0.9"
+sha2 = "0.10"
+roxmltree = "0.21"
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "hostname", "rustls", "ring", "webpki-roots"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_NetworkManagement_WNet", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_JobObjects"] }
