@@ -2,8 +2,14 @@
 
 #include <QJsonDocument>
 #include <QPointer>
+#include <QRegularExpression>
 
-static const char *kPipeName = "SteadyBackup";
+// Имя канала службы. STEADY_PIPE — как у `steady console`: вторая копия для проверок и снимков.
+static QString pipeName() {
+    const QString n = qEnvironmentVariable("STEADY_PIPE");
+    static const QRegularExpression ok(QStringLiteral("^[A-Za-z0-9_-]+$"));
+    return ok.match(n).hasMatch() ? n : QStringLiteral("SteadyBackup");
+}
 
 ServiceClient::~ServiceClient() {
     // Сокет при уничтожении шлёт disconnected. Колбэк в этот момент видит уже
@@ -44,7 +50,7 @@ ServiceClient::ServiceClient(QObject *parent) : QObject(parent) {
 
 void ServiceClient::ensureConnected() {
     if (m_socket.state() == QLocalSocket::UnconnectedState)
-        m_socket.connectToServer(kPipeName);
+        m_socket.connectToServer(pipeName());
 }
 
 void ServiceClient::call(QJsonObject request, Callback cb, QObject *guard) {

@@ -22,8 +22,12 @@ pub fn run_until(
     data_dir: PathBuf,
     seven_zip: Option<PathBuf>,
     stop: std::sync::mpsc::Receiver<()>,
+    console: bool,
 ) -> Result<()> {
-    let engine = Engine::new(data_dir, seven_zip);
+    if console {
+        crate::ipc::trust_console_user();
+    }
+    let engine = Engine::new(data_dir, seven_zip, console);
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     let (tx, rx) = tokio::sync::watch::channel(false);
     let e = engine.clone();
@@ -64,7 +68,7 @@ pub fn run_console(data_dir: PathBuf, seven_zip: Option<PathBuf>) -> Result<()> 
     });
     println!("Служба запущена в консоли. Enter — остановить.");
     let _ = tx;
-    run_until(data_dir, seven_zip, rx)
+    run_until(data_dir, seven_zip, rx, true)
 }
 
 // ---- SCM ----
@@ -127,7 +131,7 @@ fn service_body(data_dir: PathBuf, seven_zip: Option<PathBuf>) -> Result<()> {
     };
     set(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN)?;
     tracing::info!("служба запущена");
-    let r = run_until(data_dir, seven_zip, rx);
+    let r = run_until(data_dir, seven_zip, rx, false);
     set(ServiceState::Stopped, ServiceControlAccept::empty())?;
     r
 }

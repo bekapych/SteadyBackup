@@ -30,6 +30,11 @@ steady restore a.7z b.7z --target D:\Restore   файлы: полная, зат�
 IPC-команды: `status`, `list_jobs`, `get_job {job_id}`, `save_job {job}`, `delete_job {job_id}`,
 `copy_job {job_id}`, `export_settings`, `import_settings {text, replace}`,
 `run_job {job_id}`, `cancel_job {job_id}`, `history {limit}`, `protect {secret}`, `get_settings`, `save_settings {work_dir}`,
+Снимки окон без вашей службы: `steady --data-dir <временный каталог> console` с переменной
+`STEADY_PIPE=<имя>` и GUI с той же переменной (`steady-gui --shots <каталог>`). В консольном режиме GUI
+того же пользователя получает права администратора, а задания этого пользователя загружаются;
+служба Windows так не делает.
+
 `list_databases {source}` — базы сервера для источника `ms_sql` или `postgresql` (как в задании: `connection`
 или встроенные поля); заодно проверяет подключение. Только администраторам, тайм-аут 60 с.
 

@@ -65,9 +65,11 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(data_dir: PathBuf, seven_zip: Option<PathBuf>) -> Arc<Self> {
+    /// `console` — `steady console` от имени пользователя: задания этого пользователя загружаются
+    /// (у службы — только файлы, принадлежащие SYSTEM или «Администраторам»).
+    pub fn new(data_dir: PathBuf, seven_zip: Option<PathBuf>, console: bool) -> Arc<Self> {
         Arc::new(Self {
-            store: Store::for_service(&data_dir),
+            store: if console { Store::new(&data_dir) } else { Store::for_service(&data_dir) },
             data_dir,
             seven_zip,
             worker_done: Mutex::new(None),

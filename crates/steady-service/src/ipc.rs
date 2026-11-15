@@ -171,10 +171,48 @@ fn create(first: bool, sddl: &str) -> Result<NamedPipeServer> {
     unsafe { create_secure(&opts, sddl) }
 }
 
+/// Консольный режим (`steady console`): процесс работает от имени пользователя, а не SYSTEM,
+/// и прав сверх своих выдать не может. Клиент того же пользователя считается администратором —
+/// иначе в неповышенной консоли GUI открывается только для просмотра. Служба этот флаг не ставит.
+static TRUST_CONSOLE_USER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn trust_console_user() {
+    TRUST_CONSOLE_USER.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// SID пользователя из токена. `None` — токен не прочитан.
+unsafe fn token_user_sid(token: windows_sys::Win32::Foundation::HANDLE) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Security::*;
+    let mut buf = vec![0u8; 256];
+    let mut len = 0u32;
+    if GetTokenInformation(token, TokenUser, buf.as_mut_ptr() as _, buf.len() as u32, &mut len) == 0 {
+        return None;
+    }
+    let user = &*(buf.as_ptr() as *const TOKEN_USER);
+    let n = GetLengthSid(user.User.Sid);
+    Some(std::slice::from_raw_parts(user.User.Sid as *const u8, n as usize).to_vec())
+}
+
+/// SID пользователя текущего процесса.
+fn own_user_sid() -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let sid = token_user_sid(token);
+        CloseHandle(token);
+        sid
+    }
+}
+
 /// Клиент канала работает с правами администратора: повышенный (UAC) процесс администратора
 /// или SYSTEM. Неповышенный процесс того же пользователя администратором не считается —
 /// иначе любая программа в сеансе администратора могла бы через службу выполнять код от SYSTEM
-/// в обход подтверждения UAC.
+/// в обход подтверждения UAC. Исключение — консольный режим (`trust_console_user`).
 ///
 /// Токен берётся олицетворением клиента канала (ImpersonateNamedPipeClient), а не по PID:
 /// PID мог быть переиспользован другим процессом. CheckTokenMembership учитывает только
@@ -199,6 +237,13 @@ fn client_is_admin(pipe: &NamedPipeServer) -> bool {
         RevertToSelf();
         if !opened {
             return false;
+        }
+        if TRUST_CONSOLE_USER.load(std::sync::atomic::Ordering::SeqCst) {
+            let same = token_user_sid(token).is_some_and(|s| Some(s) == own_user_sid());
+            if same {
+                CloseHandle(token);
+                return true;
+            }
         }
         let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
         let mut result = false;

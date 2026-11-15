@@ -29,7 +29,9 @@ int main(int argc, char *argv[]) {
     // подключиться к его локальному серверу, и окно просмотра не должно мешать ему запуститься.
     const bool elevated = app.arguments().contains(QStringLiteral("--elevated"));
     const QString key = QStringLiteral("SteadyBackupGui-") + qEnvironmentVariable("USERNAME") +
-                        (elevated ? QStringLiteral("-admin") : QString());
+                        (elevated ? QStringLiteral("-admin") : QString()) +
+                        // Копия для другого канала (STEADY_PIPE) не мешает основной программе.
+                        (qEnvironmentVariableIsEmpty("STEADY_PIPE") ? QString() : QStringLiteral("-") + qEnvironmentVariable("STEADY_PIPE"));
     {
         QLocalSocket probe;
         probe.connectToServer(key);
