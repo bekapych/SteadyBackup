@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="*" Name="SteadyBackup" Language="1049" Codepage="1251" Version="0.1.11.0"
+  <Product Id="*" Name="SteadyBackup" Language="1049" Codepage="1251" Version="0.1.12.0"
            Manufacturer="SteadyBackup" UpgradeCode="8F4C2A1E-6B7D-4E9A-9C3F-2D5A8B1E7C40">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"
-             InstallPrivileges="elevated" Description="SteadyBackup 0.1.11" />
+             InstallPrivileges="elevated" Description="SteadyBackup 0.1.12" />
 
     <!-- Same version is replaced: each build has a new ProductCode (Id="*"). -->
     <MajorUpgrade Schedule="afterInstallValidate" AllowSameVersionUpgrades="yes"
