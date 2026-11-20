@@ -525,6 +525,14 @@ QWidget *JobDialog::buildArchivePage() {
     auto *arc = new QGroupBox(tr("Упаковка 7-Zip"));
     auto *f = new QFormLayout(arc);
     m_arcEnabled = new QCheckBox(tr("Упаковывать в архив .7z"));
+    m_arcMode = new QComboBox;
+    m_arcMode->addItem(tr("Один общий архив"), "single");
+    m_arcMode->addItem(tr("Каждый файл — в отдельный архив"), "per_file");
+    m_arcMode->addItem(tr("Каждая строка источника — в отдельный архив"), "per_source");
+    m_arcMode->addItem(tr("Каждая вложенная папка 1-го уровня — в отдельный архив"), "per_directory");
+    m_arcMode->setToolTip(tr("Вариант применяется к файловым источникам, в том числе по SSH. При разбиении по папкам "
+                             "файлы непосредственно в корне строки источника собираются в отдельный архив этой строки. "
+                             "Архивы одного запуска образуют один набор и ротируются вместе."));
     m_arcLevel = new QSpinBox;
     m_arcLevel->setRange(0, 9);
     m_arcPassword = new PasswordEdit;
@@ -533,6 +541,7 @@ QWidget *JobDialog::buildArchivePage() {
     m_arcVolume->setPlaceholderText(tr("не делить; напр. 4g или 700m"));
     m_arcTest = new QCheckBox(tr("Проверять архив после упаковки"));
     f->addRow(m_arcEnabled);
+    f->addRow(tr("Вариант архивирования:"), m_arcMode);
     f->addRow(tr("Степень сжатия (0–9):"), m_arcLevel);
     f->addRow(tr("Пароль (AES-256):"), m_arcPassword);
     f->addRow(m_arcHeaders);
@@ -540,6 +549,14 @@ QWidget *JobDialog::buildArchivePage() {
     f->addRow(m_arcTest);
     for (QWidget *w : std::initializer_list<QWidget *>{m_arcLevel, m_arcPassword, m_arcHeaders, m_arcVolume, m_arcTest})
         connect(m_arcEnabled, &QCheckBox::toggled, w, &QWidget::setEnabled);
+    const auto updateArchiveMode = [this] {
+        const QString source = m_srcType->currentData().toString();
+        const bool files = source == QLatin1String("files") || source == QLatin1String("ssh_files");
+        m_arcMode->setEnabled(m_arcEnabled->isChecked() && files);
+    };
+    connect(m_arcEnabled, &QCheckBox::toggled, this, [updateArchiveMode](bool) { updateArchiveMode(); });
+    connect(m_srcType, &QComboBox::currentIndexChanged, this, [updateArchiveMode](int) { updateArchiveMode(); });
+    updateArchiveMode();
 
     auto *ret = new QGroupBox(tr("Хранение копий"));
     auto *rf = new QFormLayout(ret);
@@ -815,6 +832,7 @@ void JobDialog::load(const QJsonObject &job) {
 
     const QJsonObject a = job.value("archive").toObject();
     m_arcEnabled->setChecked(a.value("enabled").toBool(true));
+    m_arcMode->setCurrentIndex(indexOfData(m_arcMode, a.value("mode").toString("single")));
     m_arcLevel->setValue(a.value("level").toInt(5));
     m_arcPassword->setStored(a.value("password").toString());
     m_arcHeaders->setChecked(a.value("encrypt_headers").toBool(true));
@@ -968,6 +986,7 @@ QJsonObject JobDialog::value() const {
 
     job["archive"] = QJsonObject{
         {"enabled", m_arcEnabled->isChecked()},
+        {"mode", m_arcMode->currentData().toString()},
         {"level", m_arcLevel->value()},
         {"password", m_arcPassword->value()},
         {"encrypt_headers", m_arcHeaders->isChecked()},

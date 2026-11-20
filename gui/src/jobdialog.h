@@ -110,6 +110,7 @@ private:
 
     // архив
     QCheckBox *m_arcEnabled, *m_arcHeaders, *m_arcTest;
+    QComboBox *m_arcMode;
     QSpinBox *m_arcLevel, *m_keepFull, *m_keepDays, *m_keepSets;
     PasswordEdit *m_arcPassword;
     QLineEdit *m_arcVolume;
