@@ -279,7 +279,8 @@ IPC: `list_databases {source}` работает и для `mysql` (нужен `d
   "source": { "type": "files",
               "paths": ["D:\\Docs", "\\\\srv\\share\\Projects", "https://cloud.example.ru/remote.php/dav/files/user/Work"],
               "user": "user", "password": "dpapi:...",
-              "exclude": ["*.tmp", "~$*", "**/node_modules/**"], "kind": "incremental", "full_every": 7 },
+              "exclude": ["*.tmp", "~$*", "**/node_modules/**"], "kind": "incremental", "full_every": 7,
+              "date_filter": { "field": "modified", "mode": "within", "within_hours": 24 } },
   "destinations": [ { "type": "local", "path": "E:\\Backup\\Docs" } ],
   "archive": { "mode": "per_source", "password": "dpapi:..." },
   "retention": { "keep_full": 4 },
@@ -287,6 +288,26 @@ IPC: `list_databases {source}` работает и для `mysql` (нужен `d
 }
 ```
 `user`/`password` в источнике нужны только для WebDAV-путей.
+
+`date_filter` для файловых источников (`files` и `ssh_files`) ограничивает копию по дате файла:
+
+* `field`: `modified` (по умолчанию) или `created`;
+* `mode`: `all` (по умолчанию — все файлы), `within` (не старше `within_hours` часов от начала
+  подготовки копии; по умолчанию 24) или `since` (начиная с момента `since`);
+* граница интервала включается. Для `within` число часов должно быть больше нуля;
+* для `since` используется локальное время `YYYY-MM-DDTHH:MM:SS` либо RFC 3339 со смещением.
+
+Примеры:
+
+```json
+"date_filter": { "field": "modified", "mode": "within", "within_hours": 24 }
+"date_filter": { "field": "created", "mode": "since", "since": "2026-11-19T12:00:00" }
+```
+
+Для локальных и сетевых файлов доступны обе даты. Для WebDAV дата создания требует свойства
+`creationdate`; если выбранная дата недоступна, задание завершается ошибкой. По SFTP доступна только
+дата изменения. Отфильтрованные файлы не считаются удалёнными и сохраняются в каталоге состояния
+инкрементных копий.
 
 `archive.mode` для файловых источников (`files` и `ssh_files`):
 

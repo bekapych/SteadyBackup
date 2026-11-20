@@ -8,6 +8,7 @@
 class QCheckBox;
 class QComboBox;
 class QDateTimeEdit;
+class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -104,6 +105,12 @@ private:
     QComboBox *m_vmKind;
     QSpinBox *m_vmFullEvery;
     QComboBox *m_vmConsistency;
+
+    // Общий для файловых источников фильтр даты.
+    QGroupBox *m_dateBox;
+    QComboBox *m_dateField, *m_dateMode;
+    QSpinBox *m_dateHours;
+    QDateTimeEdit *m_dateSince;
 
     // назначения
     QListWidget *m_destList;

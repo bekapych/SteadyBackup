@@ -548,6 +548,15 @@ mod tests {
     }
 
     #[test]
+    fn invalid_date_filter_is_rejected_before_scanning() {
+        let within = date_filter(FileDateField::Modified, FileDateMode::Within);
+        let zero = FileDateFilter { within_hours: 0, ..within };
+        assert!(Filter::new(&[], &[], &zero, at(2026, 11, 20, 12)).is_err());
+        let since = date_filter(FileDateField::Modified, FileDateMode::Since);
+        assert!(Filter::new(&[], &[], &since, at(2026, 11, 20, 12)).is_err());
+    }
+
+    #[test]
     fn prepare_copies_only_files_matching_modified_date() {
         let src = tmp("date-filter");
         let recent = src.join("recent.txt");

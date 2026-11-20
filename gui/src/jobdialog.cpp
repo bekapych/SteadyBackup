@@ -434,6 +434,51 @@ QWidget *JobDialog::buildSourcePage() {
     f->addRow(tr("Что копировать:"), m_srcType);
     v->addLayout(f);
     v->addWidget(m_srcPages, 1);
+
+    m_dateBox = new QGroupBox(tr("Фильтр по дате"));
+    auto *df = new QFormLayout(m_dateBox);
+    m_dateField = new QComboBox;
+    m_dateField->addItem(tr("Дата изменения"), "modified");
+    m_dateField->addItem(tr("Дата создания"), "created");
+    m_dateMode = new QComboBox;
+    m_dateMode->addItem(tr("Все файлы, без ограничения по дате"), "all");
+    m_dateMode->addItem(tr("Не старше указанного периода от начала копирования"), "within");
+    m_dateMode->addItem(tr("Начиная с указанной даты и времени"), "since");
+    m_dateHours = new QSpinBox;
+    m_dateHours->setRange(1, 100000);
+    m_dateHours->setValue(24);
+    m_dateHours->setSuffix(tr(" ч."));
+    m_dateHours->setToolTip(tr("24 часа — сутки, 168 часов — неделя. Момент отсчёта фиксируется при начале подготовки копии."));
+    m_dateSince = new QDateTimeEdit(QDateTime::currentDateTime().addDays(-1));
+    m_dateSince->setCalendarPopup(true);
+    m_dateSince->setDisplayFormat(QStringLiteral("dd.MM.yyyy HH:mm"));
+    m_dateSince->setToolTip(tr("Копируются файлы с выбранной датой не раньше этого момента (включая границу)."));
+    auto *dateHint = new QLabel(tr("Для WebDAV дата создания доступна, если сервер возвращает creationdate. "
+                                   "Протокол SFTP передаёт только дату изменения."));
+    dateHint->setWordWrap(true);
+    theme::markHint(dateHint);
+    df->addRow(tr("Дата:"), m_dateField);
+    df->addRow(tr("Условие:"), m_dateMode);
+    df->addRow(tr("Не старше:"), m_dateHours);
+    df->addRow(tr("Начиная с:"), m_dateSince);
+    df->addRow(dateHint);
+    v->addWidget(m_dateBox);
+    const auto updateDateFilter = [this] {
+        const QString source = m_srcType->currentData().toString();
+        const bool localFiles = source == QLatin1String("files");
+        const bool sshFiles = source == QLatin1String("ssh_files");
+        const bool active = localFiles || sshFiles;
+        const QString mode = m_dateMode->currentData().toString();
+        m_dateBox->setVisible(active);
+        if (sshFiles && m_dateField->currentData().toString() == QLatin1String("created"))
+            m_dateField->setCurrentIndex(0);
+        m_dateField->setEnabled(localFiles && mode != QLatin1String("all"));
+        m_dateHours->setEnabled(active && mode == QLatin1String("within"));
+        m_dateSince->setEnabled(active && mode == QLatin1String("since"));
+    };
+    connect(m_dateMode, &QComboBox::currentIndexChanged, this, [updateDateFilter](int) { updateDateFilter(); });
+    connect(m_srcType, &QComboBox::currentIndexChanged, this, [updateDateFilter](int) { updateDateFilter(); });
+    updateDateFilter();
     return page;
 }
 
@@ -818,6 +863,15 @@ void JobDialog::load(const QJsonObject &job) {
         m_vmConsistency->setCurrentIndex(indexOfData(m_vmConsistency, s.value("consistency").toString("application")));
     }
 
+    const QJsonObject dateFilter = (st == QLatin1String("files") || st == QLatin1String("ssh_files"))
+        ? s.value("date_filter").toObject()
+        : QJsonObject{};
+    m_dateField->setCurrentIndex(indexOfData(m_dateField, dateFilter.value("field").toString("modified")));
+    m_dateMode->setCurrentIndex(indexOfData(m_dateMode, dateFilter.value("mode").toString("all")));
+    m_dateHours->setValue(dateFilter.value("within_hours").toInt(24));
+    const QDateTime since = QDateTime::fromString(dateFilter.value("since").toString().left(19), Qt::ISODate);
+    if (since.isValid()) m_dateSince->setDateTime(since);
+
     m_destinations = job.value("destinations").toArray();
     refreshDestinations();
     m_client->call({{"cmd", "list_storages"}}, [this](bool ok, const QJsonValue &r, const QString &) {
@@ -980,6 +1034,17 @@ QJsonObject JobDialog::value() const {
         s["kind"] = m_vmKind->currentData().toString();
         s["full_every"] = m_vmFullEvery->value();
         s["consistency"] = m_vmConsistency->currentData().toString();
+    }
+    if (st == QLatin1String("files") || st == QLatin1String("ssh_files")) {
+        const QString mode = m_dateMode->currentData().toString();
+        QJsonObject filter{
+            {"field", m_dateField->currentData().toString()},
+            {"mode", mode},
+            {"within_hours", m_dateHours->value()},
+        };
+        if (mode == QLatin1String("since"))
+            filter["since"] = m_dateSince->dateTime().toString("yyyy-MM-ddTHH:mm:ss");
+        s["date_filter"] = filter;
     }
     job["source"] = s;
     job["destinations"] = m_destinations;
