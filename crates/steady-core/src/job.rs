@@ -695,6 +695,12 @@ mod tests {
         assert_eq!(j.process_timeout(), Duration::from_secs(3 * 3600));
     }
 
+    #[test]
+    fn old_archive_options_use_one_common_archive() {
+        let j = job(r#"{"type":"files","paths":["C:\\x"],"kind":"full"}"#);
+        assert_eq!(j.archive.mode, ArchiveMode::Single);
+    }
+
     /// Старые задания: без перезапусков, прежние 5 попыток отправки и одна — остального.
     #[test]
     fn old_job_keeps_previous_retry_behaviour() {

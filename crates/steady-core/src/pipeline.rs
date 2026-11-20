@@ -391,7 +391,117 @@ fn older_than(key: &str, days: u32, now: chrono::DateTime<chrono::Local>) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::ArchiveMode;
     use chrono::TimeZone;
+
+    fn file_staging(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("steady-file-units-{name}-{}", uuid::Uuid::new_v4().simple()));
+        let staging = root.join("staging");
+        let copied = [
+            "0_Docs/a.txt",
+            "0_Docs/Sub/b.txt",
+            "0_Docs/Sub/deep/c.txt",
+            "0_Docs/Other/d.txt",
+            "1_Projects/root.txt",
+            "1_Projects/Sub/e.txt",
+        ];
+        for key in copied {
+            let path = staging.join("data").join(key.replace('/', "\\"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, key).unwrap();
+        }
+        let manifest = serde_json::json!({
+            "kind": "incremental",
+            "created": chrono::Local::now(),
+            "sources": ["D:\\Docs", "D:\\Projects"],
+            "copied": copied,
+            "deleted": ["0_Docs/Sub/old.txt", "1_Projects/gone.txt"],
+            "failed": []
+        });
+        std::fs::write(staging.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+        (root, staging)
+    }
+
+    fn manifest(dir: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap()
+    }
+
+    fn copied(dir: &std::path::Path) -> Vec<String> {
+        serde_json::from_value(manifest(dir)["copied"].clone()).unwrap()
+    }
+
+    #[test]
+    fn single_file_archive_keeps_common_staging() {
+        let (root, staging) = file_staging("single");
+        let units = source::files::split_archives(&staging, &root, "Docs_20261120_120000_inc", ArchiveMode::Single).unwrap();
+        assert_eq!(units, vec![(staging.clone(), "Docs_20261120_120000_inc".into())]);
+        assert_eq!(copied(&staging).len(), 6);
+        assert!(staging.join("data/0_Docs/Sub/deep/c.txt").is_file());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn every_file_gets_archive_with_own_manifest() {
+        let (root, staging) = file_staging("files");
+        let units = source::files::split_archives(&staging, &root, "Docs_20261120_120000_inc", ArchiveMode::PerFile).unwrap();
+        // Шесть изменённых и два удалённых: удаление тоже должно попасть в цепочку восстановления.
+        assert_eq!(units.len(), 8);
+        for (dir, _) in &units {
+            let m = manifest(dir);
+            assert_eq!(m["copied"].as_array().unwrap().len() + m["deleted"].as_array().unwrap().len(), 1);
+        }
+        assert!(units.iter().any(|(dir, _)| dir.join("data/0_Docs/Sub/deep/c.txt").is_file()));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn every_source_line_gets_archive_with_own_changes_and_deletes() {
+        let (root, staging) = file_staging("sources");
+        let units = source::files::split_archives(&staging, &root, "Docs_20261120_120000_inc", ArchiveMode::PerSource).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(copied(&units[0].0), vec!["0_Docs/a.txt", "0_Docs/Sub/b.txt", "0_Docs/Sub/deep/c.txt", "0_Docs/Other/d.txt"]);
+        assert_eq!(copied(&units[1].0), vec!["1_Projects/root.txt", "1_Projects/Sub/e.txt"]);
+        assert_eq!(manifest(&units[0].0)["deleted"], serde_json::json!(["0_Docs/Sub/old.txt"]));
+        assert_eq!(manifest(&units[1].0)["deleted"], serde_json::json!(["1_Projects/gone.txt"]));
+        assert!(!staging.join("data/0_Docs/a.txt").exists());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn every_first_level_directory_gets_archive_and_root_files_stay_together() {
+        let (root, staging) = file_staging("dirs");
+        let units = source::files::split_archives(&staging, &root, "Docs_20261120_120000_inc", ArchiveMode::PerDirectory).unwrap();
+        assert_eq!(units.len(), 5);
+        let by_suffix = |suffix: &str| &units.iter().find(|(_, name)| name.ends_with(suffix)).unwrap().0;
+        assert_eq!(copied(by_suffix(".0_Docs")), vec!["0_Docs/a.txt"]);
+        assert_eq!(copied(by_suffix(".0_Docs.Sub")), vec!["0_Docs/Sub/b.txt", "0_Docs/Sub/deep/c.txt"]);
+        assert_eq!(copied(by_suffix(".0_Docs.Other")), vec!["0_Docs/Other/d.txt"]);
+        assert_eq!(copied(by_suffix(".1_Projects")), vec!["1_Projects/root.txt"]);
+        assert_eq!(copied(by_suffix(".1_Projects.Sub")), vec!["1_Projects/Sub/e.txt"]);
+        assert_eq!(manifest(by_suffix(".0_Docs.Sub"))["deleted"], serde_json::json!(["0_Docs/Sub/old.txt"]));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn empty_per_file_run_creates_manifest_archive() {
+        let root = std::env::temp_dir().join(format!("steady-file-units-empty-{}", uuid::Uuid::new_v4().simple()));
+        let staging = root.join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "incremental", "created": chrono::Local::now(), "sources": ["D:\\Docs"],
+                "copied": [], "deleted": [], "failed": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let units = source::files::split_archives(&staging, &root, "Docs_20261120_120000_inc", ArchiveMode::PerFile).unwrap();
+        assert_eq!(units.len(), 1);
+        assert!(units[0].1.ends_with(".manifest"));
+        assert!(copied(&units[0].0).is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn parse() {
