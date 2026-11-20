@@ -2,11 +2,11 @@
 
 use super::Prepared;
 use crate::destination::webdav::WebDavClient;
-use crate::job::BackupKind;
+use crate::job::{ArchiveMode, BackupKind};
 use crate::state::{stamp_of, Catalog, FileStamp, JobState};
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub struct FilesParams<'a> {
@@ -19,11 +19,11 @@ pub struct FilesParams<'a> {
     pub full_every: u32,
 }
 
-#[derive(Serialize)]
-struct Manifest<'a> {
+#[derive(Serialize, Deserialize)]
+struct Manifest {
     kind: BackupKind,
     created: chrono::DateTime<chrono::Local>,
-    sources: &'a [String],
+    sources: Vec<String>,
     copied: Vec<String>,
     /// Файлы, удалённые с момента базовой копии.
     deleted: Vec<String>,
@@ -170,7 +170,7 @@ pub(super) fn finish(run: Run, kind: BackupKind, state: &JobState, staging: &Pat
     let manifest = Manifest {
         kind,
         created: chrono::Local::now(),
-        sources,
+        sources: sources.to_vec(),
         copied: run.copied,
         deleted,
         failed: run.failed,
@@ -210,6 +210,102 @@ pub(super) fn finish(run: Run, kind: BackupKind, state: &JobState, staging: &Pat
         ));
     }
     Ok(Prepared { kind, new_state: Some(new_state), items: manifest.copied.len() as u64, bytes: run.bytes, warnings, packed: false, parts: vec![], failures: vec![] })
+}
+
+#[derive(Default)]
+struct ArchiveUnit {
+    copied: Vec<String>,
+    deleted: Vec<String>,
+    failed: Vec<String>,
+}
+
+/// Ключ архива для файла: весь путь, корень строки источника или его подпапка первого уровня.
+fn archive_group(mode: ArchiveMode, key: &str) -> String {
+    let (root, rel) = key.split_once('/').unwrap_or((key, ""));
+    match mode {
+        ArchiveMode::Single => "manifest".into(),
+        ArchiveMode::PerFile => key.into(),
+        ArchiveMode::PerSource => root.into(),
+        ArchiveMode::PerDirectory => match rel.split_once('/') {
+            Some((first, _)) => format!("{root}/{first}"),
+            None => root.into(),
+        },
+    }
+}
+
+/// Раскладывает файловый staging по архивам и даёт каждому собственный манифест.
+/// Без этого общий манифест требовал бы при восстановлении файлы из других архивов.
+pub(crate) fn split_archives(
+    staging: &Path,
+    run_dir: &Path,
+    set_name: &str,
+    mode: ArchiveMode,
+) -> Result<Vec<(PathBuf, String)>> {
+    if mode == ArchiveMode::Single {
+        return Ok(vec![(staging.to_path_buf(), set_name.into())]);
+    }
+    let manifest_path = staging.join("manifest.json");
+    let manifest: Manifest = serde_json::from_slice(
+        &std::fs::read(&manifest_path).with_context(|| format!("чтение {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("разбор {}", manifest_path.display()))?;
+
+    let mut groups: std::collections::BTreeMap<String, ArchiveUnit> = std::collections::BTreeMap::new();
+    if mode == ArchiveMode::PerSource {
+        // Даже строка без изменений получает архив с пустым манифестом: это её копия в наборе.
+        for (idx, source) in manifest.sources.iter().enumerate() {
+            groups.entry(root_label(idx, source)).or_default();
+        }
+    }
+    for key in &manifest.copied {
+        groups.entry(archive_group(mode, key)).or_default().copied.push(key.clone());
+    }
+    for key in &manifest.deleted {
+        groups.entry(archive_group(mode, key)).or_default().deleted.push(key.clone());
+    }
+    for key in &manifest.failed {
+        // Непрочитанный файл сам по себе не требует нового архива; если архив его группы есть,
+        // сведения об ошибке остаются и в его манифесте.
+        if let Some(unit) = groups.get_mut(&archive_group(mode, key)) {
+            unit.failed.push(key.clone());
+        }
+    }
+    if groups.is_empty() {
+        // Пустой инкремент всё равно должен оставить набор в назначении и участвовать в ротации.
+        groups.insert(
+            "manifest".into(),
+            ArchiveUnit { copied: vec![], deleted: vec![], failed: manifest.failed.clone() },
+        );
+    }
+
+    let label_bases: Vec<String> = groups.keys().map(|key| key.replace('/', ".")).collect();
+    let labels = super::unique_names(&label_bases, &[]);
+    let mut units = Vec::with_capacity(groups.len());
+    for (idx, (_, unit)) in groups.into_iter().enumerate() {
+        // Каталоги короткие и уникальные по номеру, даже если исходные имена совпали после очистки.
+        let dir = run_dir.join("file-parts").join(format!("{idx:04}"));
+        std::fs::create_dir_all(&dir).with_context(|| format!("создание {}", dir.display()))?;
+        for key in &unit.copied {
+            let rel = key.replace('/', "\\");
+            let src = staging.join("data").join(&rel);
+            let dst = dir.join("data").join(&rel);
+            let parent = dst.parent().context("файл архива без родительского каталога")?;
+            std::fs::create_dir_all(parent).with_context(|| format!("создание {}", parent.display()))?;
+            std::fs::rename(&src, &dst).with_context(|| format!("перенос {}", src.display()))?;
+        }
+        let part_manifest = Manifest {
+            kind: manifest.kind,
+            created: manifest.created,
+            sources: manifest.sources.clone(),
+            copied: unit.copied,
+            deleted: unit.deleted,
+            failed: unit.failed,
+        };
+        std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&part_manifest)?)
+            .with_context(|| format!("запись манифеста в {}", dir.display()))?;
+        units.push((dir, format!("{set_name}.{}", labels[idx])));
+    }
+    Ok(units)
 }
 
 fn scan_fs(run: &mut Run, filter: &Filter, root: &Path, label: &str) -> Result<()> {

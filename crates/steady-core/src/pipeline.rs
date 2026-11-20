@@ -2,7 +2,7 @@
 
 use crate::archive;
 use crate::destination::{self, Target};
-use crate::job::{BackupKind, Job};
+use crate::job::{BackupKind, Job, Source};
 use crate::source;
 use crate::state::StateStore;
 use anyhow::{bail, Context, Result};
@@ -86,9 +86,12 @@ pub fn run_job(ctx: &RunContext, job: &Job) -> Result<RunReport> {
 
     ctx.cancel.check()?;
     // Части копии: (каталог, имя объекта без .7z). Одна часть — весь staging под именем набора;
-    // при отдельных архивах — по каталогу на базу с именем `<набор>.<база>`. Такие имена
-    // разбираются `parse_set` как тот же набор, и ротация удаляет их вместе.
-    let units: Vec<(PathBuf, String)> = if src.separate_archives() && !prepared.parts.is_empty() {
+    // при отдельных архивах — по файлу, строке источника, подпапке или базе с именем
+    // `<набор>.<метка>`. Такие имена разбираются `parse_set` как тот же набор, и ротация
+    // удаляет их вместе.
+    let units: Vec<(PathBuf, String)> = if job.archive.enabled && matches!(&src, Source::Files { .. } | Source::SshFiles { .. }) {
+        source::files::split_archives(&staging, &run_dir, &set_name, job.archive.mode)?
+    } else if src.separate_archives() && !prepared.parts.is_empty() {
         split_parts(&run_dir, &prepared.parts, &set_name)?
     } else {
         vec![(staging.clone(), set_name.clone())]

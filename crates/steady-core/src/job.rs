@@ -592,10 +592,27 @@ fn ssh_port() -> u16 {
     22
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveMode {
+    /// Один общий архив на весь запуск задания.
+    #[default]
+    Single,
+    /// Отдельный архив на каждый файл файлового источника.
+    PerFile,
+    /// Отдельный архив на каждый путь (строку) файлового источника.
+    PerSource,
+    /// На каждую вложенную папку первого уровня каждого пути; файлы корня пути — вместе.
+    PerDirectory,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveOptions {
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// Разбиение файлового источника на архивы. Старые задания — один общий архив.
+    #[serde(default)]
+    pub mode: ArchiveMode,
     /// 0..9
     #[serde(default = "default_level")]
     pub level: u8,
@@ -619,6 +636,7 @@ impl Default for ArchiveOptions {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: ArchiveMode::Single,
             level: default_level(),
             password: None,
             encrypt_headers: true,
