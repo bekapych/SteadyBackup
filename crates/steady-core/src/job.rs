@@ -714,6 +714,20 @@ mod tests {
     }
 
     #[test]
+    fn old_file_job_has_date_filter_disabled() {
+        let j = job(r#"{"type":"files","paths":["C:\\x"],"kind":"full"}"#);
+        match j.source {
+            Source::Files { date_filter, .. } => {
+                assert_eq!(date_filter.mode, FileDateMode::All);
+                assert_eq!(date_filter.field, FileDateField::Modified);
+                assert_eq!(date_filter.within_hours, 24);
+                assert!(date_filter.since.is_none());
+            }
+            _ => panic!("ожидался файловый источник"),
+        }
+    }
+
+    #[test]
     fn old_archive_options_use_one_common_archive() {
         let j = job(r#"{"type":"files","paths":["C:\\x"],"kind":"full"}"#);
         assert_eq!(j.archive.mode, ArchiveMode::Single);

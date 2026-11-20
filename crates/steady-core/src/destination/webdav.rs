@@ -363,7 +363,7 @@ mod tests {
         let xml = r#"<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:">
  <d:response><d:href>/dav/backup/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
- <d:response><d:href>http://srv/dav/backup/%D0%9A%D0%BE%D0%BF%D0%B8%D1%8F%201.7z</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>42</d:getcontentlength><d:getlastmodified>Mon, 09 Nov 2026 12:00:00 GMT</d:getlastmodified></d:prop></d:propstat></d:response>
+ <d:response><d:href>http://srv/dav/backup/%D0%9A%D0%BE%D0%BF%D0%B8%D1%8F%201.7z</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>42</d:getcontentlength><d:getlastmodified>Mon, 09 Nov 2026 12:00:00 GMT</d:getlastmodified><d:creationdate>2026-11-08T10:30:00Z</d:creationdate></d:prop></d:propstat></d:response>
  <d:response><d:href>/dav/backup/sub/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop></d:propstat></d:response>
 </d:multistatus>"#;
         let v = parse_propfind(xml, "/dav/backup", "").unwrap();
@@ -371,6 +371,7 @@ mod tests {
         assert_eq!(v[0].rel, "Копия 1.7z");
         assert_eq!(v[0].size, 42);
         assert!(v[0].mtime > 0);
+        assert!(v[0].created.is_some_and(|t| t > 0));
         assert!(v[1].is_dir);
         assert_eq!(v[1].rel, "sub");
     }

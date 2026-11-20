@@ -422,7 +422,98 @@ fn build_set(patterns: &[String]) -> Result<Option<GlobSet>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::{FileDateField, FileDateFilter, FileDateMode};
+    use chrono::TimeZone;
     use serde::Deserialize;
+
+    fn at(y: i32, m: u32, d: u32, h: u32) -> chrono::DateTime<chrono::Local> {
+        chrono::Local.with_ymd_and_hms(y, m, d, h, 0, 0).single().expect("дата")
+    }
+
+    fn ns(t: chrono::DateTime<chrono::Local>) -> i128 {
+        t.timestamp_nanos_opt().expect("наносекунды") as i128
+    }
+
+    fn date_filter(field: FileDateField, mode: FileDateMode) -> FileDateFilter {
+        FileDateFilter { field, mode, within_hours: 24, since: None }
+    }
+
+    #[test]
+    fn relative_date_filter_accepts_only_last_24_hours() {
+        let now = at(2026, 11, 20, 12);
+        let filter = Filter::new(&[], &[], &date_filter(FileDateField::Modified, FileDateMode::Within), now).unwrap();
+        let recent = FileStamp { size: 1, mtime: ns(at(2026, 11, 20, 11)) };
+        let boundary = FileStamp { size: 1, mtime: ns(at(2026, 11, 19, 12)) };
+        let old = FileStamp { size: 1, mtime: ns(at(2026, 11, 18, 13)) };
+        assert!(filter.accepts_date(&recent, None).unwrap());
+        assert!(filter.accepts_date(&boundary, None).unwrap(), "не старше суток — включая границу");
+        assert!(!filter.accepts_date(&old, None).unwrap());
+    }
+
+    #[test]
+    fn date_filter_can_use_creation_instead_of_modification() {
+        let now = at(2026, 11, 20, 12);
+        let filter = Filter::new(&[], &[], &date_filter(FileDateField::Created, FileDateMode::Within), now).unwrap();
+        let stamp = FileStamp { size: 1, mtime: ns(at(2026, 11, 1, 12)) };
+        assert!(filter.accepts_date(&stamp, Some(ns(at(2026, 11, 20, 11)))).unwrap());
+        assert!(!filter.accepts_date(&stamp, Some(ns(at(2026, 11, 1, 12)))).unwrap());
+        assert!(filter.accepts_date(&stamp, None).is_err(), "нет даты создания — явная ошибка, а не неполная копия");
+    }
+
+    #[test]
+    fn fixed_date_filter_accepts_files_since_selected_moment() {
+        let mut options = date_filter(FileDateField::Modified, FileDateMode::Since);
+        options.since = Some("2026-11-19T12:00:00".into());
+        let filter = Filter::new(&[], &[], &options, at(2026, 11, 20, 12)).unwrap();
+        let before = FileStamp { size: 1, mtime: ns(at(2026, 11, 19, 11)) };
+        let boundary = FileStamp { size: 1, mtime: ns(at(2026, 11, 19, 12)) };
+        let after = FileStamp { size: 1, mtime: ns(at(2026, 11, 19, 13)) };
+        assert!(!filter.accepts_date(&before, None).unwrap());
+        assert!(filter.accepts_date(&boundary, None).unwrap());
+        assert!(filter.accepts_date(&after, None).unwrap());
+    }
+
+    #[test]
+    fn date_filtered_file_is_not_reported_as_deleted() {
+        let mut run = run_stub(&[], &[]);
+        run.date_filtered("0_src/old.txt".into());
+        assert!(seen(&run, "0_src/old.txt"));
+        assert!(!seen(&run, "0_src/other.txt"));
+    }
+
+    #[test]
+    fn prepare_copies_only_files_matching_modified_date() {
+        let src = tmp("date-filter");
+        let recent = src.join("recent.txt");
+        let old = src.join("old.txt");
+        std::fs::write(&recent, b"recent").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600)),
+        )
+        .unwrap();
+        let paths = vec![src.to_string_lossy().into_owned()];
+        let options = date_filter(FileDateField::Modified, FileDateMode::Within);
+        let p = FilesParams {
+            paths: &paths,
+            user: None,
+            password: None,
+            include: &[],
+            exclude: &[],
+            date_filter: &options,
+            requested: BackupKind::Full,
+            full_every: 0,
+        };
+        let staging = tmp("date-filter-stage");
+        let prepared = prepare(&p, &JobState::default(), &staging).unwrap();
+        let man: Man = serde_json::from_slice(&std::fs::read(staging.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(prepared.items, 1);
+        assert!(has_suffix(&man.copied, "/recent.txt"));
+        assert!(!has_suffix(&man.copied, "/old.txt"));
+        std::fs::remove_dir_all(src).ok();
+        std::fs::remove_dir_all(staging).ok();
+    }
 
     fn run_stub(failed: &[&str], prefixes: &[&str]) -> Run<'static> {
         Run {
