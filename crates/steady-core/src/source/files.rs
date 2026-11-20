@@ -2,8 +2,8 @@
 
 use super::Prepared;
 use crate::destination::webdav::WebDavClient;
-use crate::job::{ArchiveMode, BackupKind};
-use crate::state::{stamp_of, Catalog, FileStamp, JobState};
+use crate::job::{ArchiveMode, BackupKind, FileDateField, FileDateFilter, FileDateMode};
+use crate::state::{metadata_of, Catalog, FileStamp, JobState};
 use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ pub struct FilesParams<'a> {
     pub password: Option<&'a str>,
     pub include: &'a [String],
     pub exclude: &'a [String],
+    pub date_filter: &'a FileDateFilter,
     pub requested: BackupKind,
     pub full_every: u32,
 }
@@ -34,11 +35,46 @@ struct Manifest {
 pub(super) struct Filter {
     inc: Option<GlobSet>,
     exc: Option<GlobSet>,
+    date_field: FileDateField,
+    /// Наносекунды UNIX-эпохи; None — фильтр даты выключен.
+    date_cutoff: Option<i128>,
 }
 
 impl Filter {
-    pub(super) fn new(include: &[String], exclude: &[String]) -> Result<Self> {
-        Ok(Filter { inc: build_set(include)?, exc: build_set(exclude)? })
+    pub(super) fn new(
+        include: &[String],
+        exclude: &[String],
+        date: &FileDateFilter,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Result<Self> {
+        let cutoff = match date.mode {
+            FileDateMode::All => None,
+            FileDateMode::Within => {
+                if date.within_hours == 0 {
+                    bail!("период фильтра даты должен быть больше нуля часов");
+                }
+                now.checked_sub_signed(chrono::Duration::hours(i64::from(date.within_hours)))
+            }
+            FileDateMode::Since => {
+                let value = date.since.as_deref().map(str::trim).filter(|s| !s.is_empty()).context("не задана дата фильтра")?;
+                let parsed = if let Ok(d) = chrono::DateTime::parse_from_rfc3339(value) {
+                    d.with_timezone(&chrono::Local)
+                } else {
+                    let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))
+                        .with_context(|| format!("некорректная дата фильтра: {value}"))?;
+                    naive
+                        .and_local_timezone(chrono::Local)
+                        .single()
+                        .context("неоднозначное локальное время фильтра")?
+                };
+                Some(parsed)
+            }
+        };
+        let date_cutoff = cutoff
+            .map(|d| d.timestamp_nanos_opt().map(|n| n as i128).context("дата фильтра вне допустимого диапазона"))
+            .transpose()?;
+        Ok(Filter { inc: build_set(include)?, exc: build_set(exclude)?, date_field: date.field, date_cutoff })
     }
 
     pub(super) fn accepts(&self, rel: &str) -> bool {
@@ -55,6 +91,15 @@ impl Filter {
         }
         true
     }
+
+    pub(super) fn accepts_date(&self, stamp: &FileStamp, created: Option<i128>) -> Result<bool> {
+        let Some(cutoff) = self.date_cutoff else { return Ok(true) };
+        let value = match self.date_field {
+            FileDateField::Modified => stamp.mtime,
+            FileDateField::Created => created.context("дата создания файла недоступна")?,
+        };
+        Ok(value >= cutoff)
+    }
 }
 
 pub(super) struct Run<'a> {
@@ -63,6 +108,8 @@ pub(super) struct Run<'a> {
     current: Catalog,
     copied: Vec<String>,
     failed: Vec<String>,
+    /// Файлы существуют, но не подходят по дате: они не должны считаться удалёнными.
+    date_skipped: Vec<String>,
     pub(super) skipped_links: u32,
     pub(super) empty_dirs: u32,
     /// Ключи каталогов, которые не удалось обойти. Файлы под ними не видели и не считаем удалёнными.
@@ -90,6 +137,15 @@ impl Run<'_> {
         self.failed.push(key);
     }
 
+    pub(super) fn date_filtered(&mut self, key: String) {
+        // Сохраняем прежний штамп: иначе уже после следующей копии реальное удаление
+        // этого файла перестало бы попадать в манифест.
+        if let Some(stamp) = self.base.and_then(|b| b.files.get(&key).copied()) {
+            self.current.files.insert(key.clone(), stamp);
+        }
+        self.date_skipped.push(key);
+    }
+
     pub(super) fn dst(&self, key: &str) -> Result<PathBuf> {
         let p = self.data_root.join(key.replace('/', "\\"));
         if let Some(d) = p.parent() {
@@ -103,7 +159,7 @@ pub fn prepare(p: &FilesParams, state: &JobState, staging: &Path) -> Result<Prep
     if p.paths.is_empty() {
         bail!("не указаны исходные папки");
     }
-    let filter = Filter::new(p.include, p.exclude)?;
+    let filter = Filter::new(p.include, p.exclude, p.date_filter, chrono::Local::now())?;
     let kind = effective_kind(p.requested, p.full_every, state);
     let mut run = Run::start(kind, state, staging);
 
@@ -150,6 +206,7 @@ impl<'a> Run<'a> {
             current: Catalog::default(),
             copied: vec![],
             failed: vec![],
+            date_skipped: vec![],
             skipped_links: 0,
             empty_dirs: 0,
             unseen_prefixes: vec![],
@@ -355,13 +412,17 @@ fn scan_fs(run: &mut Run, filter: &Filter, root: &Path, label: &str) -> Result<(
         }
         crate::process::check_cancel()?;
         let key = format!("{label}/{rel}");
-        let stamp = match stamp_of(entry.path()) {
+        let (stamp, created) = match metadata_of(entry.path()) {
             Ok(s) => s,
             Err(e) => {
                 run.fail(key, e);
                 continue;
             }
         };
+        if !filter.accepts_date(&stamp, created).with_context(|| format!("фильтр даты: {key}"))? {
+            run.date_filtered(key);
+            continue;
+        }
         if run.changed(&key, &stamp) {
             crate::settings::ensure_free(&run.data_root, stamp.size)?;
             let dst = run.dst(&key)?;
@@ -387,6 +448,10 @@ fn scan_webdav(run: &mut Run, filter: &Filter, url: &str, label: &str, user: Opt
         crate::process::check_cancel()?;
         let key = format!("{label}/{}", f.rel);
         let stamp = FileStamp { size: f.size, mtime: f.mtime };
+        if !filter.accepts_date(&stamp, f.created).with_context(|| format!("фильтр даты WebDAV: {key}"))? {
+            run.date_filtered(key);
+            continue;
+        }
         if run.changed(&key, &stamp) {
             crate::settings::ensure_free(&run.data_root, stamp.size)?;
             let dst = run.dst(&key)?;
@@ -405,6 +470,7 @@ fn scan_webdav(run: &mut Run, filter: &Filter, url: &str, label: &str, user: Opt
 fn seen(run: &Run, key: &str) -> bool {
     run.current.files.contains_key(key)
         || run.failed.iter().any(|f| f == key)
+        || run.date_skipped.iter().any(|f| f == key)
         || run.unseen_prefixes.iter().any(|p| key == p || key.starts_with(p) && key[p.len()..].starts_with('/'))
 }
 
@@ -515,6 +581,40 @@ mod tests {
         std::fs::remove_dir_all(staging).ok();
     }
 
+    #[test]
+    fn date_filtered_file_stays_in_state_catalog() {
+        let src = tmp("date-filter-state");
+        let old = src.join("old.txt");
+        std::fs::write(&old, b"old").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600)),
+        )
+        .unwrap();
+        let (_, first, _) = prepare_at(&src, &JobState::default(), BackupKind::Full);
+        let state = first.new_state.expect("первое состояние");
+        let key = state.last_any.as_ref().unwrap().files.keys().next().unwrap().clone();
+
+        let paths = vec![src.to_string_lossy().into_owned()];
+        let options = date_filter(FileDateField::Modified, FileDateMode::Within);
+        let p = FilesParams {
+            paths: &paths,
+            user: None,
+            password: None,
+            include: &[],
+            exclude: &[],
+            date_filter: &options,
+            requested: BackupKind::Incremental,
+            full_every: 0,
+        };
+        let staging = tmp("date-filter-state-stage");
+        let prepared = prepare(&p, &state, &staging).unwrap();
+        let next = prepared.new_state.expect("следующее состояние");
+        assert!(next.last_any.as_ref().unwrap().files.contains_key(&key), "фильтр не должен выбрасывать файл из каталога состояния");
+        std::fs::remove_dir_all(src).ok();
+        std::fs::remove_dir_all(staging).ok();
+    }
+
     fn run_stub(failed: &[&str], prefixes: &[&str]) -> Run<'static> {
         Run {
             base: None,
@@ -522,6 +622,7 @@ mod tests {
             current: Catalog::default(),
             copied: vec![],
             failed: failed.iter().map(|s| (*s).to_string()).collect(),
+            date_skipped: vec![],
             unseen_prefixes: prefixes.iter().map(|s| (*s).to_string()).collect(),
             skipped_links: 0,
             empty_dirs: 0,
@@ -557,12 +658,14 @@ mod tests {
         let staging = tmp("stage");
         let path = root.to_string_lossy().into_owned();
         let paths = vec![path];
+        let date_filter = FileDateFilter::default();
         let p = FilesParams {
             paths: &paths,
             user: None,
             password: None,
             include: &[],
             exclude: &[],
+            date_filter: &date_filter,
             requested: kind,
             full_every: 0,
         };

@@ -62,13 +62,14 @@ pub fn prepare(
     attempts: u32,
 ) -> Result<Prepared> {
     match source {
-        Source::Files { paths, user, password, include, exclude, kind, full_every, .. } => files::prepare(
+        Source::Files { paths, user, password, include, exclude, date_filter, kind, full_every, .. } => files::prepare(
             &files::FilesParams {
                 paths,
                 user: user.as_deref(),
                 password: reveal_opt(password.as_deref())?.as_deref(),
                 include,
                 exclude,
+                date_filter,
                 requested: *kind,
                 full_every: *full_every,
             },
@@ -161,12 +162,13 @@ pub fn prepare(
             },
             staging,
         ),
-        Source::SshFiles { ssh, paths, include, exclude, kind, full_every, .. } => sshfiles::prepare(
+        Source::SshFiles { ssh, paths, include, exclude, date_filter, kind, full_every, .. } => sshfiles::prepare(
             &sshfiles::SshFilesParams {
                 ssh: ssh.as_ref().context("не задано подключение SSH")?,
                 paths,
                 include,
                 exclude,
+                date_filter,
                 requested: *kind,
                 full_every: *full_every,
             },

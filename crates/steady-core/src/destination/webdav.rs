@@ -20,6 +20,8 @@ pub struct DavEntry {
     pub size: u64,
     /// mtime в наносекундах от UNIX-эпохи.
     pub mtime: i128,
+    /// creationdate в наносекундах от UNIX-эпохи; сервер может не сообщать это свойство.
+    pub created: Option<i128>,
 }
 
 pub struct WebDavClient {
@@ -185,7 +187,7 @@ impl WebDavClient {
     /// PROPFIND Depth: 1 для каталога `rel` ("" — базовый).
     pub fn list_dir(&self, rel: &str) -> Result<Vec<DavEntry>> {
         let url = format!("{}/", self.url(rel).trim_end_matches('/'));
-        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>"#;
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:creationdate/></d:prop></d:propfind>"#;
         let resp = self.agent.run(
             self.request("PROPFIND", &url)
                 .header("Depth", "1")
@@ -272,8 +274,12 @@ fn parse_propfind(xml: &str, dir_path: &str, dir_rel: &str) -> Result<Vec<DavEnt
             .and_then(|d| d.timestamp_nanos_opt())
             .map(|n| n as i128)
             .unwrap_or(0);
+        let created = text("creationdate")
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+            .and_then(|d| d.timestamp_nanos_opt())
+            .map(|n| n as i128);
         let rel = if dir_rel.is_empty() { name.to_string() } else { format!("{}/{name}", dir_rel.trim_matches('/')) };
-        out.push(DavEntry { rel, is_dir, size, mtime });
+        out.push(DavEntry { rel, is_dir, size, mtime, created });
     }
     Ok(out)
 }

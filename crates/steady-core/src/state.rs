@@ -66,14 +66,21 @@ impl StateStore {
     }
 }
 
-pub fn stamp_of(path: &Path) -> Result<FileStamp> {
+fn unix_nanos(t: std::time::SystemTime) -> i128 {
+    t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0)
+}
+
+/// Штамп для каталога изменений и необязательная дата создания для фильтра.
+/// Дату создания не сохраняем в `FileStamp`: иначе старый каталог задания счёл бы все файлы изменёнными.
+pub fn metadata_of(path: &Path) -> Result<(FileStamp, Option<i128>)> {
     let md = std::fs::metadata(path)?;
-    let mtime = md
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i128)
-        .unwrap_or(0);
-    Ok(FileStamp { size: md.len(), mtime })
+    let mtime = md.modified().map(unix_nanos)?;
+    let created = md.created().ok().map(unix_nanos);
+    Ok((FileStamp { size: md.len(), mtime }, created))
+}
+
+pub fn stamp_of(path: &Path) -> Result<FileStamp> {
+    metadata_of(path).map(|v| v.0)
 }
 
 #[cfg(test)]

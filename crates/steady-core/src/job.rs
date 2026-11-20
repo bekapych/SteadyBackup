@@ -255,6 +255,52 @@ impl BackupKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDateField {
+    /// Дата последнего изменения содержимого.
+    #[default]
+    Modified,
+    /// Дата создания файла (не поддерживается протоколом SFTP).
+    Created,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDateMode {
+    /// Не ограничивать файлы по дате.
+    #[default]
+    All,
+    /// Копировать файлы не старше `within_hours` от начала подготовки копии.
+    Within,
+    /// Копировать файлы начиная с локальной даты и времени `since`.
+    Since,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDateFilter {
+    #[serde(default)]
+    pub field: FileDateField,
+    #[serde(default)]
+    pub mode: FileDateMode,
+    /// Период для `within`, часов. Должен быть больше нуля; по умолчанию сутки.
+    #[serde(default = "default_date_within_hours")]
+    pub within_hours: u32,
+    /// Порог для `since`: `YYYY-MM-DDTHH:MM:SS` в локальном времени или RFC 3339 со смещением.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
+fn default_date_within_hours() -> u32 {
+    24
+}
+
+impl Default for FileDateFilter {
+    fn default() -> Self {
+        Self { field: FileDateField::Modified, mode: FileDateMode::All, within_hours: default_date_within_hours(), since: None }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Source {
@@ -273,6 +319,9 @@ pub enum Source {
         include: Vec<String>,
         #[serde(default)]
         exclude: Vec<String>,
+        /// Дополнительный фильтр по дате изменения или создания файла.
+        #[serde(default)]
+        date_filter: FileDateFilter,
         kind: BackupKind,
         /// Сделать полную копию, если с последней полной прошло столько копий (0 = никогда автоматически).
         #[serde(default)]
@@ -448,6 +497,9 @@ pub enum Source {
         include: Vec<String>,
         #[serde(default)]
         exclude: Vec<String>,
+        /// По SFTP доступна дата изменения; протокол не передаёт дату создания.
+        #[serde(default)]
+        date_filter: FileDateFilter,
         #[serde(default = "full_kind")]
         kind: BackupKind,
         /// Полная копия каждые N копий (0 — никогда автоматически).

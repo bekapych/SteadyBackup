@@ -3,7 +3,7 @@
 
 use super::files::{effective_kind, finish, root_label, Filter, Run};
 use super::Prepared;
-use crate::job::{BackupKind, SshLogin};
+use crate::job::{BackupKind, FileDateField, FileDateFilter, FileDateMode, SshLogin};
 use crate::ssh::SshSession;
 use crate::state::{FileStamp, JobState};
 use anyhow::{bail, Context, Result};
@@ -16,6 +16,7 @@ pub struct SshFilesParams<'a> {
     pub paths: &'a [String],
     pub include: &'a [String],
     pub exclude: &'a [String],
+    pub date_filter: &'a FileDateFilter,
     pub requested: BackupKind,
     pub full_every: u32,
 }
@@ -114,7 +115,10 @@ pub fn prepare(p: &SshFilesParams, state: &JobState, staging: &Path) -> Result<P
     if paths.is_empty() {
         bail!("не указаны каталоги на сервере");
     }
-    let filter = Filter::new(p.include, p.exclude)?;
+    if p.date_filter.mode != FileDateMode::All && p.date_filter.field == FileDateField::Created {
+        bail!("SFTP не передаёт дату создания файла: выберите фильтр по дате изменения");
+    }
+    let filter = Filter::new(p.include, p.exclude, p.date_filter, chrono::Local::now())?;
     let kind = effective_kind(p.requested, p.full_every, state);
     let mut run = Run::start(kind, state, staging);
     // Повтор всей подготовки (и подключения) — в конвейере (`Job::step_attempts`).
@@ -138,6 +142,10 @@ pub fn prepare(p: &SshFilesParams, state: &JobState, staging: &Path) -> Result<P
             }
             crate::process::check_cancel()?;
             let key = format!("{label}/{}", f.rel);
+            if !filter.accepts_date(&f.stamp, None).with_context(|| format!("фильтр даты SFTP: {key}"))? {
+                run.date_filtered(key);
+                continue;
+            }
             if !run.changed(&key, &f.stamp) {
                 run.record(key, f.stamp, None);
                 continue;
