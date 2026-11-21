@@ -4,7 +4,7 @@
 param(
     [string]$WixBin = (Join-Path $env:TEMP 'wix314'),
     [string]$Source = (Join-Path $PSScriptRoot '..\dist\payload'),
-    [string]$Out = (Join-Path $PSScriptRoot '..\dist\SteadyBackup-0.1.12.msi'),
+    [string]$Out = (Join-Path $PSScriptRoot '..\dist\SteadyBackup-0.1.13.msi'),
     [string]$Icon = (Join-Path $PSScriptRoot '..\gui\res\steady.ico')
 )
 $ErrorActionPreference = 'Stop'
