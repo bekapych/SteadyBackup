@@ -91,7 +91,7 @@ SFTP поддерживает только `modified`. Отфильтрован�
 | **PostgreSQL** | `pg_dump -Fc` по каждой базе (`<база>.dump`); пусто — все базы из `pg_database` (через `psql`). Опционально `pg_dumpall --globals-only` → `globals.sql`. Проверка — `pg_restore --list`. Пароль через `PGPASSWORD`; имя базы передаётся как `dbname='…'`. Утилиты из одного каталога `bin`, проверка `acl::check_trusted_exe`. Подключение типа `postgresql` (`host`, `port`, `user`, `password`). | Полная |
 | **MySQL по SSH** (`source/mysql.rs`) | Вход по SSH (`ssh.rs`, russh, сжатие zlib), на сервере `sh -c` запускает `mysqldump`/`mariadb-dump --single-transaction --databases <база>`; вывод канала пишется в `<база>.sql`. Учётные данные MySQL — через stdin во временный файл 0600 (`--defaults-extra-file`), имя базы — в одинарных кавычках (`ssh::sh_quote`). Пусто — все базы из `SHOW DATABASES` без системных. Проверка — строка `-- Dump completed`. Повтор каждой базы через новое соединение, `separate_archives`. | Полная |
 | **Файлы по SSH** (`source/sshfiles.rs`) | SFTP поверх того же входа: обход каталогов в ширину, скачивание изменённых файлов. Каталог изменений, манифест и правила «удалён / не прочитан» общие с `files.rs` (`Run`, `finish`); mtime SFTP — секунды. | Полная / Инкр. / Дифф. |
-| **Файлы** | Локальные, UNC (SMB), WebDAV. Открытые файлы — через VSS (локальные тома). Каталог состояния в SQLite (путь, размер, mtime, опц. хеш BLAKE3). | Полная / Инкр. / Дифф. / Зеркало |
+| **Файлы** | Локальные пути, UNC (SMB), WebDAV. Для локальных томов — один аварийно согласованный VSS-снимок-набор без writers (`VSS_CTX_FILE_SHARE_BACKUP`), чтение через snapshot device object и удаление снимка после обхода; UNC/WebDAV — напрямую. Настройка `vss` (по умолчанию включена). Каталог состояния — JSON (путь, размер, mtime). | Полная / Инкр. / Дифф. |
 | **Hyper-V** | Production checkpoint (VSS внутри гостя) → копирование VHDX/конфигурации → слияние checkpoint. Через WMI `root\virtualization\v2`. Этап 1: `Export-VM` (просто и надёжно). Этап 2: RCT (Resilient Change Tracking) для инкрементных копий. | Полная (→ Инкр. на RCT) |
 
 ### Логика инкрементных/дифференциальных копий файлов
@@ -153,7 +153,8 @@ docs/
 | 5 | GUI на Qt 6: трей, список заданий, редактор заданий и назначений, проверка подключения, журнал, уведомления | ✅ |
 | 6 | Hyper-V: recovery-checkpoint (VSS гостя, откат на crash-consistent), экспорт через WMI, инкрементные копии по RCT, checkpoint → reference point (без хвостов .avhdx) | ✅ полная → инкр. → инкр.; цепочка восстановлена `steady restore-vm`, данные совпадают, ВМ стартует |
 | 6 | Уведомления: e-mail (SMTP, TLS/STARTTLS), Telegram; условие «всегда / проблемы / ошибки»; тест из GUI | ✅ e-mail проверен на SMTP с авторизацией; Telegram — проверены ошибки API, нужен реальный бот |
-| 7 | VSS для файлов и 1Cv8.1CD, MSSQL без sqlcmd (tiberius) | |
+| 7 | VSS для файлов | ✅ локальные тома, единый snapshot set, auto-release и явное удаление |
+| 7 | VSS для 1Cv8.1CD, MSSQL без sqlcmd (tiberius) | |
 | 8 | Pre/post-события, восстановление из GUI, MSI-установщик | |
 
 ## Сборка и установка

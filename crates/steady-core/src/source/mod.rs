@@ -6,6 +6,7 @@ pub mod mysql;
 pub mod onec;
 pub mod postgres;
 pub mod sshfiles;
+pub mod vss;
 
 use crate::job::{BackupKind, Source};
 use crate::secret::reveal_opt;
@@ -52,7 +53,8 @@ pub(crate) fn unique_names(items: &[String], reserved: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// `timeout` — предельное время каждого внешнего процесса источника (1С, sqlcmd, PowerShell).
+/// `timeout` — предельное время каждого внешнего процесса источника (1С, sqlcmd, PowerShell)
+/// и ожидания создания VSS-снимка.
 /// `attempts` — попыток каждой базы у источников с `Source::retries_per_item`.
 pub fn prepare(
     source: &Source,
@@ -62,7 +64,7 @@ pub fn prepare(
     attempts: u32,
 ) -> Result<Prepared> {
     match source {
-        Source::Files { paths, user, password, include, exclude, date_filter, kind, full_every, .. } => files::prepare(
+        Source::Files { paths, user, password, include, exclude, date_filter, vss, kind, full_every, .. } => files::prepare(
             &files::FilesParams {
                 paths,
                 user: user.as_deref(),
@@ -72,6 +74,8 @@ pub fn prepare(
                 date_filter,
                 requested: *kind,
                 full_every: *full_every,
+                vss: *vss,
+                timeout,
             },
             state,
             staging,

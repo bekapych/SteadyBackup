@@ -25,4 +25,5 @@ roxmltree = "0.21"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "hostname", "rustls", "ring", "webpki-roots"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_NetworkManagement_WNet", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_JobObjects"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_NetworkManagement_WNet", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_JobObjects", "Win32_System_Com", "Win32_System_WindowsProgramming"] }
+winapi = { workspace = true, features = ["std", "vsbackup", "vss", "vsserror", "vswriter", "unknwnbase", "winnt", "wtypes", "minwindef", "basetsd", "ntdef", "ktmtypes", "rpcndr", "wtypesbase", "wingdi", "windef", "excpt", "vcruntime"] }

@@ -115,6 +115,10 @@ QWidget *JobDialog::buildSourcePage() {
         m_filesExclude = new QLineEdit;
         m_filesExclude->setPlaceholderText(QStringLiteral("*.tmp; ~$*; **/node_modules/**"));
         m_filesConn = new ConnectionPicker(m_client, "web_dav", tr("без учётных данных"));
+        m_filesVss = new QCheckBox(tr("Теневое копирование (VSS) для локальных дисков"));
+        m_filesVss->setChecked(true);
+        m_filesVss->setToolTip(tr("Позволяет копировать открытые файлы из снимка на один момент времени. "
+                                  "Сетевые и WebDAV-пути читаются напрямую. Нужны права администратора."));
         f->addRow(tr("Пути:"), m_filesPaths);
         f->addRow(QString(), add);
         f->addRow(tr("Тип копии:"), m_filesKind);
@@ -122,6 +126,7 @@ QWidget *JobDialog::buildSourcePage() {
         f->addRow(tr("Включать:"), m_filesInclude);
         f->addRow(tr("Исключать:"), m_filesExclude);
         f->addRow(tr("Вход WebDAV:"), m_filesConn);
+        f->addRow(m_filesVss);
         m_srcPages->addWidget(w);
     }
     { // 1C
@@ -803,6 +808,7 @@ void JobDialog::load(const QJsonObject &job) {
         m_filesFullEvery->setValue(s.value("full_every").toInt());
         m_filesFullEvery->setEnabled(m_filesKind->currentData().toString() != QLatin1String("full"));
         m_filesConn->setSource(s);
+        m_filesVss->setChecked(s.value("vss").toBool(true));
     } else if (st == "one_c") {
         m_onecPath->setText(s.value("ib_path").toString());
         m_onecExe->setText(s.value("platform_exe").toString());
@@ -973,6 +979,7 @@ QJsonObject JobDialog::value() const {
         s["exclude"] = toArray(util::splitList(m_filesExclude->text()));
         s["kind"] = m_filesKind->currentData().toString();
         s["full_every"] = m_filesFullEvery->value();
+        s["vss"] = m_filesVss->isChecked();
         m_filesConn->apply(s);
     } else if (st == "one_c") {
         s["ib_path"] = m_onecPath->text().trimmed();

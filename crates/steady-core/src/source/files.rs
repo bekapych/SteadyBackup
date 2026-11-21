@@ -18,6 +18,8 @@ pub struct FilesParams<'a> {
     pub date_filter: &'a FileDateFilter,
     pub requested: BackupKind,
     pub full_every: u32,
+    pub vss: bool,
+    pub timeout: std::time::Duration,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -161,19 +163,37 @@ pub fn prepare(p: &FilesParams, state: &JobState, staging: &Path) -> Result<Prep
     }
     let filter = Filter::new(p.include, p.exclude, p.date_filter, chrono::Local::now())?;
     let kind = effective_kind(p.requested, p.full_every, state);
-    let mut run = Run::start(kind, state, staging);
-
-    for (idx, root) in p.paths.iter().enumerate() {
-        let is_dav = root.starts_with("http://") || root.starts_with("https://");
-        // Каждый источник в своей подпапке: "0_Docs", "1_Projects" ...
-        let label = root_label(idx, root);
-        if is_dav {
-            scan_webdav(&mut run, &filter, root, &label, p.user, p.password)?;
-        } else {
-            scan_fs(&mut run, &filter, Path::new(root), &label)?;
+    let snapshots = if p.vss { Some(super::vss::VssSet::create(p.paths, p.timeout)?) } else { None };
+    let result = (|| {
+        let mut run = Run::start(kind, state, staging);
+        for (idx, root) in p.paths.iter().enumerate() {
+            let is_dav = root.starts_with("http://") || root.starts_with("https://");
+            // Каждый источник в своей подпапке: "0_Docs", "1_Projects" ...
+            let label = root_label(idx, root);
+            if is_dav {
+                scan_webdav(&mut run, &filter, root, &label, p.user, p.password)?;
+            } else {
+                let scan_root = match &snapshots {
+                    Some(s) => s.scan_path(root)?,
+                    None => PathBuf::from(root),
+                };
+                scan_fs(&mut run, &filter, &scan_root, &label)?;
+            }
         }
+        finish(run, kind, state, staging, p.paths)
+    })();
+    match snapshots {
+        Some(s) => match (result, s.close()) {
+            (Ok(prepared), Ok(())) => Ok(prepared),
+            (Err(e), Ok(())) => Err(e),
+            (Ok(_), Err(e)) => Err(e.context("VSS: очистка после подготовки файлов")),
+            (Err(e), Err(cleanup)) => {
+                tracing::error!("VSS: очистка после ошибки подготовки: {cleanup:#}");
+                Err(e)
+            }
+        },
+        None => result,
     }
-    finish(run, kind, state, staging, p.paths)
 }
 
 /// Вид копии с учётом состояния: первая, принудительная и «полная каждые N» — полные.
@@ -579,6 +599,8 @@ mod tests {
             date_filter: &options,
             requested: BackupKind::Full,
             full_every: 0,
+            vss: false,
+            timeout: std::time::Duration::from_secs(60),
         };
         let staging = tmp("date-filter-stage");
         let prepared = prepare(&p, &JobState::default(), &staging).unwrap();
@@ -615,6 +637,8 @@ mod tests {
             date_filter: &options,
             requested: BackupKind::Incremental,
             full_every: 0,
+            vss: false,
+            timeout: std::time::Duration::from_secs(60),
         };
         let staging = tmp("date-filter-state-stage");
         let prepared = prepare(&p, &state, &staging).unwrap();
@@ -677,6 +701,8 @@ mod tests {
             date_filter: &date_filter,
             requested: kind,
             full_every: 0,
+            vss: false,
+            timeout: std::time::Duration::from_secs(60),
         };
         let prepared = prepare(&p, state, &staging).unwrap();
         let man: Man = serde_json::from_slice(&std::fs::read(staging.join("manifest.json")).unwrap()).unwrap();
@@ -718,6 +744,44 @@ mod tests {
         assert!(has_suffix(&man.copied, "/busy.txt"), "copied: {:?}", man.copied);
         assert!(!has_suffix(&man.deleted, "/busy.txt"), "deleted: {:?}", man.deleted);
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    /// Приёмка на машине администратора: эксклюзивная блокировка исходника не мешает чтению снимка.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "требует права администратора и доступную службу VSS"]
+    fn vss_copies_exclusively_locked_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let src = tmp("vss-src");
+        let busy = src.join("busy.txt");
+        std::fs::write(&busy, b"from-snapshot").unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).write(true).share_mode(0).open(&busy).unwrap();
+
+        let paths = vec![src.to_string_lossy().into_owned()];
+        let date_filter = FileDateFilter::default();
+        let p = FilesParams {
+            paths: &paths,
+            user: None,
+            password: None,
+            include: &[],
+            exclude: &[],
+            date_filter: &date_filter,
+            requested: BackupKind::Full,
+            full_every: 0,
+            vss: true,
+            timeout: std::time::Duration::from_secs(120),
+        };
+        let staging = tmp("vss-stage");
+        let prepared = prepare(&p, &JobState::default(), &staging).unwrap();
+        let man: Man = serde_json::from_slice(&std::fs::read(staging.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(prepared.items, 1);
+        assert!(man.failed.is_empty(), "failed: {:?}", man.failed);
+        let key = man.copied.iter().find(|k| k.ends_with("/busy.txt")).expect("busy.txt в манифесте");
+        assert_eq!(std::fs::read(staging.join("data").join(key.replace('/', "\\"))).unwrap(), b"from-snapshot");
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(src);
+        let _ = std::fs::remove_dir_all(staging);
     }
 
     /// Каталог, который не удалось прочитать, не превращает свои файлы в deleted.

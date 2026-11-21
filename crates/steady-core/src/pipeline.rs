@@ -673,7 +673,7 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let job = |second: &std::path::Path| -> Job {
             serde_json::from_str(&format!(
-                r#"{{"id":"{id}","name":"Docs","source":{{"type":"files","paths":["{src}"],"kind":"incremental"}},"destinations":[{{"type":"local","path":"{d1}"}},{{"type":"local","path":"{second}"}}],"archive":{{"enabled":false}}}}"#,
+                r#"{{"id":"{id}","name":"Docs","source":{{"type":"files","paths":["{src}"],"kind":"incremental","vss":false}},"destinations":[{{"type":"local","path":"{d1}"}},{{"type":"local","path":"{second}"}}],"archive":{{"enabled":false}}}}"#,
                 src = src.display().to_string().replace('\\', "\\\\"),
                 d1 = d1.display().to_string().replace('\\', "\\\\"),
                 second = second.display().to_string().replace('\\', "\\\\"),

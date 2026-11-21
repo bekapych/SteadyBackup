@@ -280,7 +280,7 @@ IPC: `list_databases {source}` работает и для `mysql` (нужен `d
               "paths": ["D:\\Docs", "\\\\srv\\share\\Projects", "https://cloud.example.ru/remote.php/dav/files/user/Work"],
               "user": "user", "password": "dpapi:...",
               "exclude": ["*.tmp", "~$*", "**/node_modules/**"], "kind": "incremental", "full_every": 7,
-              "date_filter": { "field": "modified", "mode": "within", "within_hours": 24 } },
+              "vss": true, "date_filter": { "field": "modified", "mode": "within", "within_hours": 24 } },
   "destinations": [ { "type": "local", "path": "E:\\Backup\\Docs" } ],
   "archive": { "mode": "per_source", "password": "dpapi:..." },
   "retention": { "keep_full": 4 },
@@ -288,6 +288,14 @@ IPC: `list_databases {source}` работает и для `mysql` (нужен `d
 }
 ```
 `user`/`password` в источнике нужны только для WebDAV-путей.
+
+`vss` (по умолчанию `true`, в том числе для старых заданий) создаёт один временный VSS-снимок-набор
+для всех локальных томов источника и читает файлы из него. Снимок аварийно согласованный (без участия
+VSS-writers приложений), удаляется после подготовки файлов, в том числе при ошибке или отмене. Для его
+создания нужны права администратора или Backup Operators; при недоступности VSS задание завершается
+ошибкой, а не незаметно копирует изменяющиеся файлы. UNC и WebDAV всегда читаются напрямую. Для прежнего
+прямого копирования локальных файлов задайте `"vss": false`. На `ssh_files` и другие источники настройка
+не распространяется.
 
 `date_filter` для файловых источников (`files` и `ssh_files`) ограничивает копию по дате файла:
 

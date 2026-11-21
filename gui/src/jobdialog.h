@@ -71,6 +71,7 @@ private:
     class ConnectionPicker *m_filesConn;
     QComboBox *m_filesKind;
     QSpinBox *m_filesFullEvery;
+    QCheckBox *m_filesVss;
     QLineEdit *m_onecPath, *m_onecExe, *m_onecUnlock;
     ConnectionPicker *m_onecConn;
     QComboBox *m_onecMode;

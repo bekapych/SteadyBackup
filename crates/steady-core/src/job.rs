@@ -18,9 +18,10 @@ pub struct Job {
     /// Выполнить пропущенный запуск (служба/компьютер были выключены), как только появится возможность.
     #[serde(default = "yes")]
     pub run_missed: bool,
-    /// Предельное время работы внешних программ (1С, sqlcmd, PowerShell для Hyper-V, 7-Zip), минут.
-    /// Ограничивает каждый запуск отдельно; по истечении процесс и его потомки завершаются,
-    /// задание завершается ошибкой. 0 / нет — значение по умолчанию для типа источника
+    /// Предельное время работы внешних программ (1С, sqlcmd, PowerShell для Hyper-V, 7-Zip)
+    /// и ожидания создания VSS-снимка, минут. Ограничивает каждый запуск отдельно; по истечении
+    /// процесс и его потомки завершаются, VSS-операция отменяется, задание завершается ошибкой.
+    /// 0 / нет — значение по умолчанию для типа источника
     /// (`Source::default_timeout`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_minutes: Option<u32>,
@@ -322,6 +323,10 @@ pub enum Source {
         /// Дополнительный фильтр по дате изменения или создания файла.
         #[serde(default)]
         date_filter: FileDateFilter,
+        /// Читать локальные диски через временный VSS-снимок. UNC и WebDAV всегда читаются напрямую.
+        /// Требуются права администратора или Backup Operators; снимок удаляется после подготовки файлов.
+        #[serde(default = "yes")]
+        vss: bool,
         kind: BackupKind,
         /// Сделать полную копию, если с последней полной прошло столько копий (0 = никогда автоматически).
         #[serde(default)]
@@ -777,6 +782,15 @@ mod tests {
             }
             _ => panic!("ожидался файловый источник"),
         }
+    }
+
+    #[test]
+    fn file_vss_is_enabled_for_old_jobs_and_can_be_disabled() {
+        let old = job(r#"{"type":"files","paths":["C:\\x"],"kind":"full"}"#);
+        assert!(matches!(old.source, Source::Files { vss: true, .. }));
+
+        let direct = job(r#"{"type":"files","paths":["C:\\x"],"kind":"full","vss":false}"#);
+        assert!(matches!(direct.source, Source::Files { vss: false, .. }));
     }
 
     #[test]

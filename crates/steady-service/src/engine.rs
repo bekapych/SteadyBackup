@@ -721,7 +721,7 @@ mod tests {
         let id = Uuid::new_v4();
         let esc = |p: &std::path::Path| p.display().to_string().replace('\\', "\\\\");
         let job: steady_core::Job = serde_json::from_str(&format!(
-            r#"{{"id":"{id}","name":"t","source":{{"type":"files","paths":["{}"],"kind":"full"}},"destinations":[{{"type":"local","path":"{}"}}],"archive":{{"enabled":false}}}}"#,
+            r#"{{"id":"{id}","name":"t","source":{{"type":"files","paths":["{}"],"kind":"full","vss":false}},"destinations":[{{"type":"local","path":"{}"}}],"archive":{{"enabled":false}}}}"#,
             esc(&src),
             esc(&dst)
         ))
