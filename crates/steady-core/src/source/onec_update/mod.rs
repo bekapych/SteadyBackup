@@ -20,6 +20,15 @@ use platform::Platform;
 use sessions::{ComLock, RacBase};
 use std::path::{Path, PathBuf};
 
+/// Код, с которым будут открываться COM/DESIGNER-подключения после блокировки.
+/// Пустой `/UC` нельзя оставлять: блокировка с пустым кодом запрещает вообще все новые
+/// сеансы, включая проверку сеансов и последующее снятие блокировки самим заданием.
+pub fn ensure_unlock_code(uc: &mut String) {
+    if uc.trim().is_empty() {
+        *uc = format!("steady-{}", uuid::Uuid::new_v4().simple());
+    }
+}
+
 pub fn no_op_report(job: &str, warnings: Vec<String>) -> RunReport {
     RunReport {
         job: job.to_string(),
@@ -84,7 +93,7 @@ pub fn run(ctx: &RunContext, job: &Job, source: &Source) -> Result<RunReport> {
     let password = crate::secret::reveal_opt(password.as_deref())?.unwrap_or_default();
     let cluster_password =
         crate::secret::reveal_opt(cluster_password.as_deref())?.unwrap_or_default();
-    let platform = Platform {
+    let mut platform = Platform {
         exe,
         target,
         user: user.clone().unwrap_or_default(),
@@ -178,6 +187,9 @@ pub fn run(ctx: &RunContext, job: &Job, source: &Source) -> Result<RunReport> {
         ctx,
         &format!("«{}»: блокировка и завершение сеансов 1С", job.name),
     );
+    // Код нужен и для последующих подключений, и для восстановления: блокировка
+    // с пустым кодом запретила бы любой новый сеанс, в том числе наш собственный.
+    ensure_unlock_code(&mut platform.uc);
     let lock = ComLock::acquire(&platform)?;
     let mut update_started = false;
     let mut published_dt: Option<PathBuf> = None;

@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use steady_core::source::onec_update::{
-    backup_file_name, file_arg_matches, missing_intermediate, no_op_report, parse_rac_records,
-    parse_update_info, plan, rac_session_ids, read_cfu_sources, scan, select, ConfigInfo, Package,
-    PackageKind, Target, Version,
+    backup_file_name, ensure_unlock_code, file_arg_matches, missing_intermediate, no_op_report,
+    parse_rac_records, parse_update_info, plan, rac_session_ids, read_cfu_sources, scan, select,
+    ConfigInfo, Package, PackageKind, Target, Version,
 };
 use steady_core::{Job, RunReport, Source};
 
@@ -459,6 +459,21 @@ fn no_op_report_is_explicitly_skipped_and_has_no_backup() {
     );
     assert!(report.errors.is_empty());
     assert_eq!(report.warnings, vec!["предупреждение"]);
+}
+
+#[test]
+fn empty_unlock_code_is_replaced_with_temporary_code() {
+    let mut code = String::new();
+    ensure_unlock_code(&mut code);
+    assert!(!code.is_empty());
+    assert!(code.starts_with("steady-"));
+    let generated = code.clone();
+    ensure_unlock_code(&mut code);
+    assert_eq!(code, generated, "повторный вызов не должен менять код");
+
+    let mut given = "existing-code".to_string();
+    ensure_unlock_code(&mut given);
+    assert_eq!(given, "existing-code");
 }
 
 #[test]
