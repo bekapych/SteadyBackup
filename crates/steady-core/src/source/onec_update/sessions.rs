@@ -450,10 +450,11 @@ try {
     say("RESTORED");
   } else if (action == "sessions") {
     var own = c.НомерСеансаИнформационнойБазы();
-    var ss = (new VBArray(c.ПолучитьСеансыИнформационнойБазы())).toArray();
+    var ss = c.ПолучитьСеансыИнформационнойБазы();
     var n = 0;
-    for (var i = 0; i < ss.length; i++) {
-      if (ss[i].НомерСеанса != own) n++;
+    // Это коллекция 1С, а не SAFEARRAY: VBArray здесь неприменим.
+    for (var i = 0; i < ss.Количество(); i++) {
+      if (ss.Получить(i).НомерСеанса != own) n++;
     }
     say("SESSIONS " + n);
   } else {
@@ -728,6 +729,10 @@ mod tests {
         assert!(SESSIONS_JS.contains("c.НомерСеансаИнформационнойБазы()"));
         assert!(!SESSIONS_JS.contains("c.НомерСеанса()"));
         assert!(!SESSIONS_JS.contains("ЗавершитьСеанс"));
+        // Это коллекция 1С, а не COM SAFEARRAY: VBArray здесь неприменим.
+        assert!(!SESSIONS_JS.contains("new VBArray"));
+        assert!(SESSIONS_JS.contains("ss.Количество()"));
+        assert!(SESSIONS_JS.contains("ss.Получить(i)"));
     }
 
     #[test]
