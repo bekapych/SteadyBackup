@@ -122,8 +122,11 @@ pub(crate) fn truncate(s: &str, max_chars: usize) -> &str {
 /// downgrade на http недопустим. Заголовок `Authorization` при перенаправлении сохраняется
 /// лишь для того же хоста.
 pub fn build_agent(proxy: Option<&DownloadProxy>, insecure_tls: bool) -> Result<ureq::Agent> {
+    // Корни берём из хранилища Windows: webpki-набор в native-tls не всегда содержит
+    // корпоративные УЦ, а без него Windows сам строит цепочку через SChannel.
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
         .disable_verification(insecure_tls)
         .build();
     let mut config = ureq::Agent::config_builder()

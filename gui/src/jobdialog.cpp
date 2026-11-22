@@ -25,6 +25,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QTabWidget>
@@ -95,6 +96,309 @@ static bool itsAccountDialog(QWidget *parent, QJsonObject &account) {
 static QString tableCell(const QTableWidget *t, int row, int col) {
     const QTableWidgetItem *it = t->item(row, col);
     return it ? it->text().trimmed() : QString();
+}
+
+// Роли ячейки «Конфигурация» в окне выбора из ИТС: текста с пометкой «уже в задании» мало,
+// в задание нужно писать исходные значения с портала.
+enum ItsCellRole {
+    ProgramRole = Qt::UserRole, // program_name (в том виде, в каком его ждёт служба)
+    HumanNameRole = Qt::UserRole + 1,
+    VersionRole = Qt::UserRole + 2,
+};
+
+// Выбор конфигураций, доступных учётной записи ИТС. Список берётся у службы
+// (list_its_configurations), запрос асинхронный: окно задания не ждёт сеть.
+// Пароль учётки уходит в запрос как есть: сохранённый в задании (dpapi:stored) служба
+// отклонит понятной ошибкой «введите пароль учётной записи ИТС» — её показываем в диалоге.
+class ItsConfigurationsDialog : public QDialog {
+public:
+    ItsConfigurationsDialog(ServiceClient *client, const QJsonArray &accounts, const QStringList &present,
+                            const QJsonObject &proxy, bool insecureTls, bool proxyPasswordHidden,
+                            QWidget *parent = nullptr);
+
+    // Отмеченные строки в формате задания: human_name, program_name, start_version, its_account.
+    QJsonArray selected() const;
+
+private:
+    void fetch();
+    void fill(const QJsonArray &list);
+    void filterRows(const QString &text);
+    void updateState();
+    int currentAccountIndex() const;
+    QString currentAccountName() const;
+
+    ServiceClient *m_client;
+    QJsonArray m_accounts;
+    QStringList m_present; // program_name уже добавленных в задание
+    QJsonObject m_proxy;
+    bool m_insecure = false;
+    QComboBox *m_account = nullptr;
+    QPushButton *m_fetch = nullptr;
+    QLineEdit *m_filter = nullptr;
+    QTableWidget *m_table = nullptr;
+    QLabel *m_status = nullptr;
+    QPushButton *m_add = nullptr;
+    bool m_loading = false;
+    int m_seq = 0; // ответы на устаревшие запросы игнорируются
+};
+
+ItsConfigurationsDialog::ItsConfigurationsDialog(ServiceClient *client, const QJsonArray &accounts,
+                                                 const QStringList &present, const QJsonObject &proxy,
+                                                 bool insecureTls, bool proxyPasswordHidden, QWidget *parent)
+    : QDialog(parent), m_client(client), m_accounts(accounts), m_present(present), m_proxy(proxy),
+      m_insecure(insecureTls) {
+    setWindowTitle(QObject::tr("Конфигурации учётной записи ИТС"));
+    resize(880, 580);
+
+    m_account = new SteadyCombo;
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        const QJsonObject a = m_accounts.at(i).toObject();
+        QString text = a.value("name").toString().trimmed();
+        if (text.isEmpty()) text = QObject::tr("без имени");
+        const QString user = a.value("username").toString().trimmed();
+        text += QStringLiteral(" — ") + (user.isEmpty() ? QObject::tr("без логина") : user);
+        m_account->addItem(text, i);
+    }
+    m_account->setToolTip(QObject::tr("Учётные записи ИТС из задания. Пароль тоже берётся из задания."));
+    m_fetch = new QPushButton(QObject::tr("Получить список"));
+    m_fetch->setToolTip(QObject::tr("Войти на releases.1c.ru и получить конфигурации, доступные этой учётке."));
+    connect(m_fetch, &QPushButton::clicked, this, [this] { fetch(); });
+    // Список относится к своей учётке: при смене учётки прежние строки не показываем.
+    connect(m_account, &QComboBox::currentIndexChanged, this, [this](int) {
+        ++m_seq;
+        m_loading = false;
+        m_table->setRowCount(0);
+        m_status->setText(QObject::tr("Нажмите «Получить список»: при открытии окна список не запрашивается."));
+        theme::setState(m_status, theme::Muted);
+        updateState();
+    });
+
+    m_filter = new QLineEdit;
+    m_filter->setPlaceholderText(QObject::tr("по названию или группе"));
+    m_filter->setClearButtonEnabled(true);
+    connect(m_filter, &QLineEdit::textChanged, this, [this](const QString &t) { filterRows(t); });
+
+    m_table = new QTableWidget(0, 3);
+    m_table->setHorizontalHeaderLabels(
+        {QObject::tr("Группа"), QObject::tr("Конфигурация"), QObject::tr("Последняя версия")});
+    m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_table->setShowGrid(false);
+    m_table->verticalHeader()->hide();
+    m_table->horizontalHeader()->setHighlightSections(false);
+    m_table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    // Название занимает свободное место, служебные колонки — по содержимому:
+    // иначе пометка «уже в задании» обрезается многоточием.
+    m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_table->horizontalHeaderItem(2)->setToolTip(QObject::tr("Версия на портале — не версия вашей базы."));
+    m_table->setToolTip(QObject::tr("Отметьте нужные конфигурации, затем «Добавить отмеченные»."));
+    connect(m_table, &QTableWidget::itemChanged, this, [this](QTableWidgetItem *) { updateState(); });
+
+    m_status = new QLabel(QObject::tr("Нажмите «Получить список»: при открытии окна список не запрашивается."));
+    m_status->setWordWrap(true);
+    m_status->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    theme::setState(m_status, theme::Muted);
+
+    auto *hint = new QLabel(QObject::tr(
+        "«Последняя версия» — то, что сейчас опубликовано на портале. В задание она попадает как начальная "
+        "(start_version), поэтому после добавления замените её на текущую версию вашей базы: иначе "
+        "обновление не будет найдено. Строки, которые уже есть в задании, отмечены и повторно не добавятся. "
+        "Прокси и проверка TLS-сертификата берутся из формы задания."));
+    hint->setWordWrap(true);
+    theme::markHint(hint);
+    QLabel *proxyHint = nullptr;
+    if (proxyPasswordHidden) {
+        proxyHint = new QLabel(QObject::tr(
+            "Пароль прокси хранится в задании и форме недоступен: если прокси требует вход, запрос уйдёт "
+            "без пароля — введите его в поле «Прокси» формы задания и повторите."));
+        proxyHint->setWordWrap(true);
+        theme::setState(proxyHint, theme::Warn);
+    }
+
+    m_add = new QPushButton(QObject::tr("Добавить отмеченные"));
+    m_add->setObjectName(QStringLiteral("primary"));
+    m_add->setToolTip(QObject::tr("Добавить отмеченные конфигурации в задание."));
+    auto *cancel = new QPushButton(QObject::tr("Отмена"));
+    connect(m_add, &QPushButton::clicked, this, &QDialog::accept);
+    connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
+
+    auto *top = new QHBoxLayout;
+    top->addWidget(new QLabel(QObject::tr("Учётная запись:")));
+    top->addWidget(m_account, 1);
+    top->addWidget(m_fetch);
+    auto *filterRow = new QHBoxLayout;
+    filterRow->addWidget(new QLabel(QObject::tr("Фильтр:")));
+    filterRow->addWidget(m_filter, 1);
+    auto *buttons = new QHBoxLayout;
+    buttons->addStretch();
+    buttons->addWidget(m_add);
+    buttons->addWidget(cancel);
+
+    auto *v = new QVBoxLayout(this);
+    v->addLayout(top);
+    v->addLayout(filterRow);
+    v->addWidget(m_table, 1);
+    v->addWidget(hint);
+    if (proxyHint) v->addWidget(proxyHint);
+    v->addWidget(m_status);
+    v->addLayout(buttons);
+    util::keepButtonsOnScreen(this);
+    updateState();
+}
+
+int ItsConfigurationsDialog::currentAccountIndex() const {
+    // Данные пункта — номер учётки в m_accounts; пустой список даёт 0 при size 0.
+    const int i = m_account->currentData().toInt();
+    return i >= 0 && i < m_accounts.size() ? i : -1;
+}
+
+QString ItsConfigurationsDialog::currentAccountName() const {
+    const int i = currentAccountIndex();
+    return i < 0 ? QString() : m_accounts.at(i).toObject().value("name").toString().trimmed();
+}
+
+void ItsConfigurationsDialog::fetch() {
+    const int i = currentAccountIndex();
+    if (i < 0) return;
+    const QJsonObject account = m_accounts.at(i).toObject();
+    const QString user = account.value("username").toString().trimmed();
+    if (user.isEmpty()) {
+        m_status->setText(QObject::tr("У выбранной учётной записи нет логина: добавьте его в списке "
+                                      "учётных записей ИТС."));
+        theme::setState(m_status, theme::Warn);
+        return;
+    }
+    const QString password = account.value("password").toString();
+    if (password.isEmpty()) {
+        m_status->setText(QObject::tr("У выбранной учётной записи нет пароля: введите его в списке "
+                                      "учётных записей ИТС."));
+        theme::setState(m_status, theme::Warn);
+        return;
+    }
+    QJsonObject request{
+        {QStringLiteral("cmd"), QStringLiteral("list_its_configurations")},
+        {QStringLiteral("username"), user},
+        // Маркер dpapi:stored уходит в службу как есть: она ответит «введите пароль учётной записи ИТС».
+        {QStringLiteral("password"), password},
+        {QStringLiteral("insecure_tls"), m_insecure},
+    };
+    if (m_proxy.isEmpty())
+        request[QStringLiteral("proxy")] = QJsonValue(QJsonValue::Null);
+    else
+        request[QStringLiteral("proxy")] = m_proxy;
+    const int seq = ++m_seq;
+    m_loading = true;
+    m_status->setText(QObject::tr("Запрос списка конфигураций на releases.1c.ru…"));
+    theme::setState(m_status, theme::Muted);
+    updateState();
+    m_client->call(request, [this, seq](bool ok, const QJsonValue &r, const QString &err) {
+        if (seq != m_seq) return; // учётку успели сменить — ответ не нужен
+        m_loading = false;
+        if (!ok) {
+            m_table->setRowCount(0);
+            m_status->setText(QObject::tr("Ошибка: %1").arg(err));
+            theme::setState(m_status, theme::Error);
+            updateState();
+            return;
+        }
+        const QJsonArray list = r.toArray();
+        fill(list);
+        if (list.isEmpty()) {
+            m_status->setText(QObject::tr("Служба вернула пустой список конфигураций."));
+            theme::setState(m_status, theme::Warn);
+        } else {
+            m_status->setText(QObject::tr("Конфигураций: %1. Отметьте нужные и нажмите «Добавить отмеченные».")
+                                  .arg(list.size()));
+            theme::setState(m_status, theme::Ok);
+        }
+        updateState();
+    }, this);
+}
+
+void ItsConfigurationsDialog::fill(const QJsonArray &list) {
+    // Отметки ставим до показа строк: onChanged не должен пересчитывать кнопки на каждой строке.
+    const QSignalBlocker block(m_table);
+    m_table->setRowCount(list.size());
+    for (int r = 0; r < list.size(); ++r) {
+        const QJsonObject c = list.at(r).toObject();
+        const QString program = c.value("program_name").toString().trimmed();
+        const QString human = c.value("name").toString().trimmed();
+        const QString version = c.value("version").toString().trimmed();
+        const QString nick = c.value("nick").toString().trimmed();
+        auto *groupItem = new QTableWidgetItem(c.value("group").toString().trimmed());
+        auto *nameItem = new QTableWidgetItem(human.isEmpty() ? program : human);
+        auto *versionItem = new QTableWidgetItem(version);
+        nameItem->setData(ProgramRole, program);
+        nameItem->setData(HumanNameRole, human);
+        nameItem->setData(VersionRole, version);
+        QString tip = program.isEmpty() ? nick : QObject::tr("program_name: %1").arg(program);
+        if (!nick.isEmpty() && !program.isEmpty()) tip += QStringLiteral(" · ") + nick;
+        if (m_present.contains(program)) {
+            // Уже в задании: строка видна и отмечена, но повторно не добавляется.
+            nameItem->setCheckState(Qt::Checked);
+            nameItem->setFlags(nameItem->flags() & ~Qt::ItemIsUserCheckable);
+            nameItem->setText(nameItem->text() + QObject::tr("  ·  уже в задании"));
+            nameItem->setToolTip(QObject::tr("Эта конфигурация уже есть в задании."));
+        } else {
+            nameItem->setFlags(nameItem->flags() | Qt::ItemIsUserCheckable);
+            nameItem->setCheckState(Qt::Unchecked);
+            nameItem->setToolTip(QObject::tr("Отметьте, чтобы добавить в задание (%1).").arg(tip));
+        }
+        groupItem->setToolTip(QObject::tr("Группа на портале ИТС (условный раздел программы)."));
+        versionItem->setToolTip(QObject::tr("Опубликованная версия, а не версия вашей базы: после добавления "
+                                            "замените её на текущую версию базы."));
+        m_table->setItem(r, 0, groupItem);
+        m_table->setItem(r, 1, nameItem);
+        m_table->setItem(r, 2, versionItem);
+    }
+}
+
+void ItsConfigurationsDialog::filterRows(const QString &text) {
+    const QString needle = text.trimmed().toLower();
+    for (int r = 0; r < m_table->rowCount(); ++r) {
+        bool match = needle.isEmpty();
+        for (int c = 0; c < 2 && !match; ++c) { // группа и название
+            const QTableWidgetItem *it = m_table->item(r, c);
+            if (it && it->text().toLower().contains(needle)) match = true;
+        }
+        m_table->setRowHidden(r, !match);
+    }
+    updateState();
+}
+
+void ItsConfigurationsDialog::updateState() {
+    m_fetch->setEnabled(!m_loading && currentAccountIndex() >= 0);
+    m_account->setEnabled(!m_loading);
+    m_filter->setEnabled(!m_loading);
+    bool anyChecked = false;
+    if (!m_loading) {
+        for (int r = 0; r < m_table->rowCount() && !anyChecked; ++r) {
+            const QTableWidgetItem *it = m_table->item(r, 1);
+            // Строки, которые уже есть в задании, отмечены, но добавлять их нечего.
+            anyChecked = it && it->checkState() == Qt::Checked && (it->flags() & Qt::ItemIsUserCheckable) &&
+                         !m_table->isRowHidden(r);
+        }
+    }
+    m_add->setEnabled(anyChecked);
+}
+
+QJsonArray ItsConfigurationsDialog::selected() const {
+    QJsonArray out;
+    const QString account = currentAccountName();
+    for (int r = 0; r < m_table->rowCount(); ++r) {
+        const QTableWidgetItem *it = m_table->item(r, 1);
+        if (!it || it->checkState() != Qt::Checked || !(it->flags() & Qt::ItemIsUserCheckable)) continue;
+        const QString program = it->data(ProgramRole).toString().trimmed();
+        if (program.isEmpty()) continue;
+        out.append(QJsonObject{
+            {QStringLiteral("human_name"), it->data(HumanNameRole).toString()},
+            {QStringLiteral("program_name"), program},
+            {QStringLiteral("start_version"), it->data(VersionRole).toString()},
+            {QStringLiteral("its_account"), account},
+        });
+    }
+    return out;
 }
 
 JobDialog::JobDialog(ServiceClient *client, const QJsonObject &job, QWidget *parent)
@@ -455,6 +759,7 @@ QWidget *JobDialog::buildSourcePage() {
         m_dlConfigurations->setToolTip(tr("Учётка — имя из списка учётных записей ИТС; пусто — первая учётная запись."));
         m_dlConfigurations->setMinimumHeight(110);
         auto *addCfg = new QPushButton(tr("Добавить"));
+        m_dlItsPick = new QPushButton(tr("Выбрать из ИТС…"));
         auto *delCfg = new QPushButton(tr("Удалить"));
         const auto addConfigRow = [this] {
             const int r = m_dlConfigurations->rowCount();
@@ -464,6 +769,7 @@ QWidget *JobDialog::buildSourcePage() {
             m_dlConfigurations->editItem(m_dlConfigurations->item(r, 0));
         };
         connect(addCfg, &QPushButton::clicked, this, addConfigRow);
+        connect(m_dlItsPick, &QPushButton::clicked, this, &JobDialog::chooseItsConfigurations);
         connect(delCfg, &QPushButton::clicked, this, [this] {
             const int r = m_dlConfigurations->currentRow();
             if (r < 0) return;
@@ -471,6 +777,7 @@ QWidget *JobDialog::buildSourcePage() {
         });
         auto *cfgButtons = new QVBoxLayout;
         cfgButtons->addWidget(addCfg);
+        cfgButtons->addWidget(m_dlItsPick);
         cfgButtons->addWidget(delCfg);
         cfgButtons->addStretch();
         cl->addWidget(m_dlConfigurations, 1);
@@ -1793,6 +2100,74 @@ void JobDialog::refreshItsAccounts() {
     };
     fill(m_dlPlatformAccount, tr("первая учётка"), prevPlatform);
     fill(m_dlReleasesAccount, tr("первая из списка"), prevReleases);
+    updateItsPickButton();
+}
+
+void JobDialog::updateItsPickButton() {
+    if (!m_dlItsPick) return;
+    // Без логина служба не войдёт на releases.1c.ru и список запрашивать нечего.
+    bool hasLogin = false;
+    for (const auto &v : std::as_const(m_dlAccountList))
+        if (!v.toObject().value("username").toString().trimmed().isEmpty()) {
+            hasLogin = true;
+            break;
+        }
+    m_dlItsPick->setEnabled(hasLogin);
+    m_dlItsPick->setToolTip(hasLogin
+                                ? tr("Запросить у releases.1c.ru конфигурации, доступные учётной записи ИТС, "
+                                     "и добавить отмеченные в задание.")
+                                : tr("Сначала добавьте учётную запись ИТС"));
+}
+
+void JobDialog::chooseItsConfigurations() {
+    // Учётки, прокси и insecure_tls — из текущего состояния формы задания.
+    const QJsonObject source = value().value("source").toObject();
+    if (source.value("type").toString() != QLatin1String("one_c_download")) return;
+    QStringList present;
+    for (int r = 0; r < m_dlConfigurations->rowCount(); ++r) {
+        const QString program = tableCell(m_dlConfigurations, r, 1);
+        if (!program.isEmpty()) present << program;
+    }
+    QJsonObject proxy;
+    bool proxyPasswordHidden = false;
+    const QJsonValue proxyValue = source.value("proxy");
+    if (proxyValue.isObject()) {
+        proxy = proxyValue.toObject();
+        const QString password = proxy.value("password").toString();
+        // Пароль прокси в задании — только маркер: форме он недоступен, в запрос не отправляем
+        // (иначе служба ругалась бы на base64). Диалог предупредит об этом.
+        if (password == QLatin1String("dpapi:stored")) {
+            proxy.remove(QStringLiteral("password"));
+            proxyPasswordHidden = true;
+        } else if (password.isEmpty()) {
+            proxy.remove(QStringLiteral("password"));
+        }
+    }
+    ItsConfigurationsDialog dlg(m_client, source.value("its_accounts").toArray(), present, proxy,
+                                m_dlInsecure->isChecked(), proxyPasswordHidden, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QJsonArray picked = dlg.selected();
+    int firstRow = -1;
+    for (const auto &v : picked) {
+        const QJsonObject c = v.toObject();
+        const QString program = c.value("program_name").toString();
+        if (program.isEmpty() || present.contains(program)) continue; // дубликатов в задании не бывает
+        const int r = m_dlConfigurations->rowCount();
+        m_dlConfigurations->insertRow(r);
+        auto *humanItem = new QTableWidgetItem(c.value("human_name").toString());
+        humanItem->setToolTip(QStringLiteral("program_name: %1").arg(program));
+        auto *versionItem = new QTableWidgetItem(c.value("start_version").toString());
+        versionItem->setToolTip(tr("Версия на портале. Замените её на текущую версию базы — иначе обновление "
+                                   "не будет найдено."));
+        m_dlConfigurations->setItem(r, 0, humanItem);
+        m_dlConfigurations->setItem(r, 1, new QTableWidgetItem(program));
+        m_dlConfigurations->setItem(r, 2, versionItem);
+        m_dlConfigurations->setItem(r, 3, new QTableWidgetItem(c.value("its_account").toString()));
+        if (firstRow < 0) firstRow = r;
+        present << program;
+    }
+    // Курсор — в колонку версии первой добавленной строки: её и нужно заменить на версию базы.
+    if (firstRow >= 0) m_dlConfigurations->setCurrentCell(firstRow, 2);
 }
 
 void JobDialog::saveShots(const QString &dir, const QString &prefix) {

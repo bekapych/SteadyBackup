@@ -133,6 +133,71 @@ pub fn parse_download_links(page: &str) -> Result<Vec<String>> {
     Ok(links)
 }
 
+/// Конфигурация (программа) из общего списка портала `releases.1c.ru/total`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortalProgram {
+    /// Группа портала («Бухгалтерский и налоговый учёт»); пусто — строка идёт до первой группы.
+    pub group: String,
+    /// Идентификатор проекта на портале (`Accounting30`) из ссылки `/project/<nick>`.
+    pub nick: String,
+    /// Название как на портале: «Бухгалтерия предприятия, редакция 3.0».
+    pub name: String,
+    /// Актуальная версия из ссылки `version_files?nick=<nick>&ver=...`; может быть пустой.
+    pub version: String,
+}
+
+/// Конфигурации, доступные учётной записи ИТС: строки таблицы страницы `/total`.
+///
+/// Строка без ссылки `/project/<nick>` (дистрибутив платформы, пояснение) пропускается.
+/// Если строк нет вовсе — ошибка: вызывающий не отличит «нет доступа» от изменившейся
+/// вёрстки портала, а пустой список в GUI выглядел бы как «конфигураций нет».
+pub fn parse_total_programs(html: &str) -> Result<Vec<PortalProgram>> {
+    static ROW: OnceLock<Regex> = OnceLock::new();
+    static GROUP: OnceLock<Regex> = OnceLock::new();
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    static VERSION: OnceLock<Regex> = OnceLock::new();
+    // Строки таблицы разбираются по одной: группа из `group-name` действует на все
+    // последующие строки, версия ищется внутри той же строки.
+    let row = re(&ROW, r"(?s)<tr\b[^>]*>(.*?)</tr>");
+    let group_re = re(&GROUP, r#"<span class="group-name[^"]*">([^<]*)</span>"#);
+    let name_re = re(
+        &NAME,
+        r#"(?s)<td class="nameColumn[^"]*"[^>]*>\s*<a href="/project/([A-Za-z0-9_]+)"[^>]*>(.*?)</a>"#,
+    );
+    let version_re = re(
+        &VERSION,
+        r#"version_files\?nick=([A-Za-z0-9_]+)(?:&amp;|&)ver=([0-9A-Za-z._-]*)"#,
+    );
+    let mut group = String::new();
+    let mut list: Vec<PortalProgram> = Vec::new();
+    for block in row.captures_iter(html) {
+        let inner = &block[1];
+        if let Some(g) = group_re.captures(inner) {
+            group = normalize_name(&html_unescape(&g[1]));
+            continue;
+        }
+        let Some(n) = name_re.captures(inner) else {
+            continue;
+        };
+        let nick = n[1].to_string();
+        let version = version_re
+            .captures_iter(inner)
+            .find(|c| &c[1] == nick.as_str())
+            .map(|c| html_unescape(&c[2]))
+            .unwrap_or_default();
+        list.push(PortalProgram {
+            group: group.clone(),
+            name: normalize_name(&html_unescape(&n[2])),
+            nick,
+            version: version.trim().to_string(),
+        });
+    }
+    if list.is_empty() {
+        bail!("на странице releases.1c.ru/total нет списка конфигураций (изменилась вёрстка портала?)");
+    }
+    Ok(list)
+}
+
 /// Схлопывает пробелы и переводы строк в названии дистрибутива.
 pub fn normalize_name(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -266,6 +331,12 @@ impl Portal {
     pub fn download_links(&self, page_url: &str) -> Result<Vec<String>> {
         let page = self.get(page_url)?;
         parse_download_links(&page)
+    }
+
+    /// Конфигурации, доступные учётной записи ИТС (общий список портала).
+    pub fn total_programs(&self) -> Result<Vec<PortalProgram>> {
+        let page = self.get(&format!("{RELEASES_URL}/total"))?;
+        parse_total_programs(&page)
     }
 
     /// Скачивание по ссылке портала (cookies уже в агенте).

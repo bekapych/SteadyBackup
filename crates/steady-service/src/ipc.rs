@@ -80,6 +80,16 @@ enum Request {
     /// Источник «Файлы по SSH» из формы: вход на сервер и наличие каждого пути.
     /// Возвращает отпечаток сервера, если он не закреплён. Только администраторам.
     CheckSshPaths { source: steady_core::Source },
+    /// Конфигурации 1С, доступные учётной записи ИТС, — для выбора в форме задания.
+    /// Только администраторам: запрос несёт пароль ИТС. Пароль в ответ не возвращается.
+    ListItsConfigurations {
+        username: String,
+        password: String,
+        #[serde(default)]
+        proxy: Option<steady_core::DownloadProxy>,
+        #[serde(default)]
+        insecure_tls: bool,
+    },
 
     // ---- хранилища и подключения ----
     ListStorages,
@@ -849,6 +859,12 @@ fn dispatch(engine: &Arc<Engine>, raw: Value, admin: bool) -> Result<Value> {
             };
             json!(names)
         }
+        Request::ListItsConfigurations { username, password, proxy, insecure_tls } => {
+            // Запрос из GUI: вход на портал и разбор страницы — не дольше двух минут.
+            const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+            // Пароль приходит из формы открытым текстом или в DPAPI — наружу не возвращается.
+            list_its_configurations(username, password, proxy, insecure_tls, TIMEOUT)?
+        }
         Request::CheckSshPaths { source } => {
             let source = Resources::new(&engine.data_dir).resolve_source(&source)?;
             let steady_core::Source::SshFiles { ssh: Some(login), paths, .. } = &source else {
@@ -910,6 +926,45 @@ fn gdrive_account_json(mut acc: gdrive::Account, custom: bool) -> Result<Value> 
         "total": info.total,
         "used": info.used,
     }))
+}
+
+/// Конфигурации ИТС для формы задания. Сетевой вызов идёт в отдельном потоке: прервать его
+/// извне нельзя, а GUI не должен ждать дольше `timeout`. Поток, не уложившийся в срок,
+/// завершится сам по тайм-аутам ureq и ничего не запишет в ответ.
+fn list_its_configurations(
+    username: String,
+    password: String,
+    proxy: Option<steady_core::DownloadProxy>,
+    insecure_tls: bool,
+    timeout: std::time::Duration,
+) -> Result<Value> {
+    let password = match password.as_str() {
+        // Маркер «сохранён» из GUI расшифровать не из чего: пароль ИТС вводится в форме.
+        steady_core::resources::STORED => bail!("введите пароль учётной записи ИТС"),
+        other => steady_core::secret::reveal(other)?,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = steady_core::source::onec_download::list_available(
+            &username,
+            &password,
+            proxy.as_ref(),
+            insecure_tls,
+        );
+        // Приёмник мог уйти по тайм-ауту: ошибку отправки игнорируем.
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(list)) => Ok(json!(list)),
+        Ok(Err(e)) => Err(e),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+            "releases.1c.ru не ответил за {} с — проверьте прокси и доступ в интернет",
+            timeout.as_secs()
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("не удалось получить список конфигураций ИТС")
+        }
+    }
 }
 
 /// Пароль из формы: открытый текст или `dpapi:...`. Маркер GUI без сохранённого значения

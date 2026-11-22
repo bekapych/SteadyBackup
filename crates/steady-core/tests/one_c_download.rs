@@ -5,9 +5,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use steady_core::source::onec_download::{
-    decode_zip_name, parse_configuration_update, parse_conf_download, parse_distributions,
-    parse_download_links, parse_platform_update, parse_releases, relative_path, report,
-    run_download, select_account, unzip, DownloadState, Progress,
+    decode_zip_name, list_available, parse_configuration_update, parse_conf_download,
+    parse_distributions, parse_download_links, parse_platform_update, parse_releases,
+    parse_total_programs, program_name_from_nick, relative_path, report, run_download,
+    select_account, unzip, AvailableConfiguration, DownloadState, Progress,
 };
 use steady_core::{DownloadProxy, DownloadReleases, ItsAccount, Job, Source};
 
@@ -620,6 +621,130 @@ fn mandatory_fields_checked_before_requests() {
     let err = run_download(&ctx, &job, &job.source).unwrap_err();
     assert!(format!("{err:#}").contains("учётная запись ИТС"), "{err:#}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Страница `/total` портала releases.1c.ru (серверный HTML с BOM): группы, строки
+/// конфигураций, версия из `version_files`, строки без `/project` пропускаются,
+/// группа у первой строки — пустая, версия может отсутствовать.
+const TOTAL_PAGE: &str = "\u{feff}<html><body><table class=\"totalTable\">
+<tr parent-group=\"481\"><td class=\"nameColumn\"><a href=\"/project/Accounting30\">Бухгалтерия предприятия, редакция 3.0</a></td><td class=\"versionColumn actualVersionColumn\"><a href=\"/version_files?nick=Accounting30&amp;ver=3.0.212.9\">3.0.212.9</a></td></tr>
+<tr group=\"accounting\"><td colspan=\"3\"><span class=\"group-name\">Бухгалтерский и налоговый учёт</span></td></tr>
+<tr parent-group=\"481\"><td class=\"nameColumn\"><a href=\"/project/AccountingCorp30\">Бухгалтерия предприятия КОРП, редакция 3.0</a></td><td class=\"versionColumn actualVersionColumn\"><a href=\"/version_files?nick=AccountingCorp30&amp;ver=3.0.212.9\">3.0.212.9</a></td></tr>
+<tr group=\"hr\"><td colspan=\"3\"><span class=\"group-name\">Кадровый учёт</span></td></tr>
+<tr parent-group=\"13\"><td class=\"nameColumn\"><a href=\"/project/HRM30\">Заработная плата и управление персоналом, редакция 3.1</a></td><td class=\"versionColumn actualVersionColumn\"><a href=\"/version_files?nick=HRM30&amp;ver=3.1.36.244\">3.1.36.244</a></td></tr>
+<tr parent-group=\"13\"><td class=\"nameColumn\"><a href=\"/project/HRMCorp30\">Заработная плата и управление персоналом КОРП, редакция 3.1</a></td><td class=\"versionColumn actualVersionColumn\"><a href=\"/version_files?nick=HRMCorp30&amp;ver=3.1.36.244\">3.1.36.244</a></td></tr>
+<tr group=\"branch\"><td colspan=\"3\"><span class=\"group-name\">Отраслевые решения</span></td></tr>
+<tr parent-group=\"77\"><td class=\"nameColumn\"><a href=\"/project/SmallBusiness30\">Малый бизнес &amp; &quot;Предпринимательство&quot;</a></td><td class=\"versionColumn actualVersionColumn\"></td></tr>
+<tr parent-group=\"77\"><td class=\"nameColumn\"><a href=\"/project/Trade11\">Управление торговлей, редакция 11</a></td><td class=\"versionColumn actualVersionColumn\"><a href=\"/version_files?nick=Trade11&amp;ver=11.5.19.111\">11.5.19.111</a></td></tr>
+<tr group=\"tech\"><td colspan=\"3\"><span class=\"group-name\">Технологические дистрибутивы</span></td></tr>
+<tr parent-group=\"9\"><td class=\"nameColumn\"><a href=\"/project/MobilePlatform\">Мобильная платформа 1С:Предприятия</a></td><td class=\"versionColumn actualVersionColumn\"></td></tr>
+<tr parent-group=\"9\"><td class=\"nameColumn\"><a href=\"/version_files?nick=Platform85&amp;ver=8.3.25.1394\">Технологическая платформа 8.3</a></td><td class=\"versionColumn actualVersionColumn\">8.3.25.1394</td></tr>
+</table></body></html>";
+
+/// Список конфигураций со страницы `/total`: группа, nick, имя и версия.
+#[test]
+fn total_page_parsed() {
+    let list = parse_total_programs(TOTAL_PAGE).unwrap();
+    let short: Vec<(&str, &str, &str)> = list
+        .iter()
+        .map(|p| (p.group.as_str(), p.nick.as_str(), p.version.as_str()))
+        .collect();
+    assert_eq!(
+        short,
+        vec![
+            ("", "Accounting30", "3.0.212.9"),
+            ("Бухгалтерский и налоговый учёт", "AccountingCorp30", "3.0.212.9"),
+            ("Кадровый учёт", "HRM30", "3.1.36.244"),
+            ("Кадровый учёт", "HRMCorp30", "3.1.36.244"),
+            ("Отраслевые решения", "SmallBusiness30", ""),
+            ("Отраслевые решения", "Trade11", "11.5.19.111"),
+            ("Технологические дистрибутивы", "MobilePlatform", ""),
+        ]
+    );
+    // Названия из HTML-сущностей раскрываются, пробелы схлопываются.
+    assert_eq!(list[0].name, "Бухгалтерия предприятия, редакция 3.0");
+    assert_eq!(list[4].name, "Малый бизнес & \"Предпринимательство\"");
+    // Строка без `/project/<nick>` в список не попадает.
+    assert!(list.iter().all(|p| p.nick != "Platform85"));
+}
+
+/// Пустая или битая страница — понятная ошибка вместо паники или пустого ответа.
+#[test]
+fn total_page_without_rows_is_error() {
+    for page in [
+        "",
+        "<html><body>нет таблицы</body></html>",
+        "<table class=\"totalTable\"></table>",
+        "<tr><td>строка без проекта</td></tr>",
+    ] {
+        let err = parse_total_programs(page).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("конфигурац"), "«{page}»: {text}");
+    }
+}
+
+/// Имя программы для сервиса обновлений: nick без суффикса редакции.
+#[test]
+fn program_name_from_nick_strips_edition() {
+    assert_eq!(program_name_from_nick("Accounting30"), "Accounting");
+    assert_eq!(program_name_from_nick("HRM30"), "HRM");
+    assert_eq!(program_name_from_nick("AccountingCorp30"), "AccountingCorp");
+    assert_eq!(program_name_from_nick("SmallBusiness30"), "SmallBusiness");
+    // Суффикса редакции нет — nick как есть.
+    assert_eq!(program_name_from_nick("MobilePlatform"), "MobilePlatform");
+    assert_eq!(program_name_from_nick("Trade11"), "Trade");
+    // Вырожденные значения не дают пустого имени.
+    assert_eq!(program_name_from_nick(""), "");
+    assert_eq!(program_name_from_nick("11"), "11");
+}
+
+/// Конфигурация для выбора в GUI: имена полей JSON и производное имя программы.
+#[test]
+fn available_configuration_serialized() {
+    let c = AvailableConfiguration {
+        group: "Бухгалтерский и налоговый учёт".into(),
+        nick: "Accounting30".into(),
+        name: "Бухгалтерия предприятия, редакция 3.0".into(),
+        program_name: program_name_from_nick("Accounting30"),
+        version: "3.0.212.9".into(),
+    };
+    let v = serde_json::to_value(&c).unwrap();
+    assert_eq!(v["group"], "Бухгалтерский и налоговый учёт");
+    assert_eq!(v["nick"], "Accounting30");
+    assert_eq!(v["name"], "Бухгалтерия предприятия, редакция 3.0");
+    assert_eq!(v["program_name"], "Accounting");
+    assert_eq!(v["version"], "3.0.212.9");
+    // Пароля в ответе нет: структура о нём не знает.
+    assert!(v.get("password").is_none());
+}
+
+/// Пустой логин отсекается до первого сетевого запроса.
+#[test]
+fn empty_its_login_rejected_without_network() {
+    let err = list_available("   ", "pass", None, false).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("логин"), "{text}");
+}
+
+/// Живая проверка списка конфигураций ИТС (нужна сеть и действующая учётная запись):
+///
+/// ```text
+/// $env:STEADY_ITS_USER = "..."; $env:STEADY_ITS_PASSWORD = "..."
+/// cargo test -p steady-core --test one_c_download -- --ignored live_its_list --nocapture
+/// ```
+///
+/// Учётные данные в тест не вписываются: только переменные окружения.
+#[test]
+#[ignore = "нужны сеть и действующая учётная запись ИТС"]
+fn live_its_list() {
+    let user = std::env::var("STEADY_ITS_USER").expect("STEADY_ITS_USER");
+    let password = std::env::var("STEADY_ITS_PASSWORD").expect("STEADY_ITS_PASSWORD");
+    let list = list_available(&user, &password, None, false).expect("список конфигураций ИТС");
+    assert!(!list.is_empty(), "список не должен быть пустым");
+    println!("конфигураций: {}", list.len());
+    for c in list.iter().take(8) {
+        println!("{} | {} | {} | {}", c.group, c.name, c.program_name, c.version);
+    }
 }
 
 /// Проверять нечего: запуск успешно пропускается, не обращаясь к сервисам.

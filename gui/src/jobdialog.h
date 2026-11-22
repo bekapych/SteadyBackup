@@ -13,6 +13,7 @@ class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPlainTextEdit;
+class QPushButton;
 class QSpinBox;
 class QStackedWidget;
 class QTableWidget;
@@ -55,6 +56,10 @@ private:
     void checkSshPaths();
     // Учётные записи ИТС: список в форме и пункты выбора учётки для платформы.
     void refreshItsAccounts();
+    // «Выбрать из ИТС…»: доступна, только если есть учётка с логином.
+    void updateItsPickButton();
+    // Конфигурации, доступные учётной записи ИТС (list_its_configurations) → строки таблицы.
+    void chooseItsConfigurations();
 
     ServiceClient *m_client;
     QJsonObject m_original;
@@ -99,6 +104,7 @@ private:
     QLineEdit *m_dlReleasesProjects;
     QPlainTextEdit *m_dlDistributions;
     QTableWidget *m_dlConfigurations;
+    QPushButton *m_dlItsPick = nullptr; // «Выбрать из ИТС…» (список конфигураций учётной записи)
     QListWidget *m_sqlDatabases; // отмеченные базы; ничего не отмечено — все пользовательские базы
     QComboBox *m_sqlArchives, *m_pgArchives; // данные: false — один архив, true — по архиву на базу
     QLineEdit *m_sqlDir;

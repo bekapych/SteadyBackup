@@ -20,7 +20,8 @@ pub use api::{
 };
 pub use paths::{decode_zip_name, relative_path};
 pub use releases::{
-    normalize_name, parse_distributions, parse_download_links, parse_releases, Distribution, Release,
+    normalize_name, parse_distributions, parse_download_links, parse_releases, parse_total_programs,
+    Distribution, PortalProgram, Release,
 };
 pub use state::DownloadState;
 pub use unzip::unzip;
@@ -32,6 +33,7 @@ use crate::job::{
 use crate::pipeline::{RunContext, RunReport};
 use anyhow::{anyhow, bail, Context, Result};
 use releases::Portal;
+use serde::Serialize;
 use std::path::Path;
 
 /// Что нашлось и что скачано за запуск.
@@ -92,6 +94,69 @@ pub fn select_account<'a>(accounts: &'a [ItsAccount], name: Option<&str>) -> Opt
             Some(first)
         }
     }
+}
+
+/// Конфигурация 1С, доступная учётной записи ИТС, — для выбора в форме задания.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AvailableConfiguration {
+    /// Группа портала («Бухгалтерский и налоговый учёт»); пусто — без группы.
+    pub group: String,
+    /// Идентификатор проекта на портале (`Accounting30`).
+    pub nick: String,
+    /// Название как на портале: «Бухгалтерия предприятия, редакция 3.0».
+    pub name: String,
+    /// Имя программы для сервиса обновлений (`Accounting`) — то, что идёт в `program_name` задания.
+    pub program_name: String,
+    /// Актуальная версия на портале; может быть пустой.
+    pub version: String,
+}
+
+/// Имя программы для сервиса обновлений из nick портала: nick без суффикса редакции.
+///
+/// Портал добавляет к имени программы номер редакции (`Accounting30` — редакция 3.0),
+/// а сервис обновлений ждёт имя без него. Если цифр в конце нет, nick возвращается как есть.
+pub fn program_name_from_nick(nick: &str) -> String {
+    let trimmed = nick.trim();
+    let name = trimmed.trim_end_matches(|c: char| c.is_ascii_digit());
+    if name.is_empty() {
+        trimmed.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Конфигурации, доступные учётной записи ИТС: вход на releases.1c.ru и разбор `/total`.
+///
+/// Список нужен форме задания, чтобы не вводить `program_name` руками. Сортировка —
+/// по группе, затем по названию. Сеть: без доступного портала вернётся ошибка входа.
+pub fn list_available(
+    login: &str,
+    password: &str,
+    proxy: Option<&DownloadProxy>,
+    insecure_tls: bool,
+) -> Result<Vec<AvailableConfiguration>> {
+    if login.trim().is_empty() {
+        bail!("не задан логин учётной записи ИТС");
+    }
+    let portal = api::build_agent(proxy, insecure_tls)
+        .and_then(|agent| Portal::login(agent, login, password))?;
+    let mut list: Vec<AvailableConfiguration> = portal
+        .total_programs()?
+        .into_iter()
+        .map(|p| AvailableConfiguration {
+            program_name: program_name_from_nick(&p.nick),
+            group: p.group,
+            nick: p.nick,
+            name: p.name,
+            version: p.version,
+        })
+        .collect();
+    // Порядок портала произвольный: в списке GUI группировка по разделам, внутри — по названию.
+    list.sort_by(|a, b| {
+        (a.group.to_lowercase(), a.name.to_lowercase())
+            .cmp(&(b.group.to_lowercase(), b.name.to_lowercase()))
+    });
+    Ok(list)
 }
 
 /// Результат запуска: отчёт для журнала и состояние — что уже скачано.
