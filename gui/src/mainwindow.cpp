@@ -844,11 +844,15 @@ void MainWindow::renderHistory() {
             details = h.value("error").toString();
         } else {
             const QJsonObject r = h.value("report").toObject();
-            details = tr("%1 · объектов: %2 · %3 · назначений: %4")
-                          .arg(r.value("set_name").toString())
-                          .arg(r.value("items").toInteger())
-                          .arg(util::formatBytes(r.value("bytes").toInteger()))
-                          .arg(r.value("destinations_ok").toInt());
+            if (r.value("skipped").toBool()) {
+                details = tr("Подходящих обновлений нет");
+            } else {
+                details = tr("%1 · объектов: %2 · %3 · назначений: %4")
+                              .arg(r.value("set_name").toString())
+                              .arg(r.value("items").toInteger())
+                              .arg(util::formatBytes(r.value("bytes").toInteger()))
+                              .arg(r.value("destinations_ok").toInt());
+            }
             for (const auto &w : warns)
                 details += QStringLiteral(" · ") + w.toString();
         }
@@ -880,10 +884,14 @@ void MainWindow::showHistoryDetails(int row) {
         lines << QString() << tr("Ошибка:") << h.value("error").toString();
     } else {
         const QJsonObject r = h.value("report").toObject();
-        lines << QString() << tr("Набор: %1").arg(r.value("set_name").toString())
-              << tr("Объектов: %1").arg(r.value("items").toInteger())
-              << tr("Объём: %1").arg(util::formatBytes(r.value("bytes").toInteger()))
-              << tr("Назначений: %1").arg(r.value("destinations_ok").toInt());
+        if (r.value("skipped").toBool()) {
+            lines << QString() << tr("Подходящих обновлений нет. База и сеансы не изменялись.");
+        } else {
+            lines << QString() << tr("Набор: %1").arg(r.value("set_name").toString())
+                  << tr("Объектов: %1").arg(r.value("items").toInteger())
+                  << tr("Объём: %1").arg(util::formatBytes(r.value("bytes").toInteger()))
+                  << tr("Назначений: %1").arg(r.value("destinations_ok").toInt());
+        }
     }
     if (!warns.isEmpty()) {
         lines << QString() << tr("Предупреждения:");

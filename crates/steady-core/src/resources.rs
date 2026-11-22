@@ -375,6 +375,14 @@ impl Resources {
                 *user = u.map(String::from);
                 *password = p.map(String::from);
             }
+            Source::OneCUpdate { connection: Some(id), user, password, .. } => {
+                let c = self.connection(id)?;
+                let ConnectionKind::OneC { user: u, password: p } = c.kind else {
+                    bail!("подключение «{id}» не является подключением к 1С");
+                };
+                *user = u;
+                *password = p;
+            }
             Source::MsSql { connection: Some(id), server, user, password, .. } => {
                 let c = self.connection(id)?;
                 let ConnectionKind::MsSql { server: srv, user: u, password: p } = c.kind else {
@@ -457,6 +465,7 @@ pub fn source_connection(s: &Source) -> Option<&str> {
     match s {
         Source::Files { connection, .. }
         | Source::OneC { connection, .. }
+        | Source::OneCUpdate { connection, .. }
         | Source::MsSql { connection, .. }
         | Source::Firebird { connection, .. }
         | Source::PostgreSql { connection, .. }

@@ -75,6 +75,11 @@ private:
     QLineEdit *m_onecPath, *m_onecExe, *m_onecUnlock;
     ConnectionPicker *m_onecConn;
     QComboBox *m_onecMode;
+    QLineEdit *m_onecUpdatePath, *m_onecUpdateUpdatesDir, *m_onecUpdateBackupDir;
+    QLineEdit *m_onecUpdateExe, *m_onecUpdateUnlock, *m_onecUpdateClusterUser;
+    PasswordEdit *m_onecUpdateClusterPassword;
+    ConnectionPicker *m_onecUpdateConn;
+    QCheckBox *m_onecUpdateForce, *m_onecUpdateServerSide, *m_onecUpdateRunHandlers;
     QListWidget *m_sqlDatabases; // отмеченные базы; ничего не отмечено — все пользовательские базы
     QComboBox *m_sqlArchives, *m_pgArchives; // данные: false — один архив, true — по архиву на базу
     QLineEdit *m_sqlDir;

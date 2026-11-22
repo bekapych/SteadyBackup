@@ -22,6 +22,8 @@ percent-encoding = "2"
 rand = "0.9"
 sha2 = "0.10"
 roxmltree = "0.21"
+flate2.workspace = true
+encoding_rs.workspace = true
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "hostname", "rustls", "ring", "webpki-roots"] }
 
 [target.'cfg(windows)'.dependencies]

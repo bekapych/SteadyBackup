@@ -949,6 +949,7 @@ fn source_kind(j: &Job) -> &'static str {
     match j.source {
         steady_core::Source::Files { .. } => "files",
         steady_core::Source::OneC { .. } => "one_c",
+        steady_core::Source::OneCUpdate { .. } => "one_c_update",
         steady_core::Source::MsSql { .. } => "ms_sql",
         steady_core::Source::HyperV { .. } => "hyper_v",
         steady_core::Source::Firebird { .. } => "firebird",

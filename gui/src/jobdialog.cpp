@@ -52,6 +52,13 @@ JobDialog::JobDialog(ServiceClient *client, const QJsonObject &job, QWidget *par
     tabs->addTab(buildDestinationsPage(), tr("Назначения"));
     tabs->addTab(buildArchivePage(), tr("Архив и хранение"));
     tabs->addTab(buildSchedulePage(), tr("Расписание"));
+    const auto updateSourceTabs = [this] {
+        const bool update = m_srcType->currentData().toString() == QLatin1String("one_c_update");
+        m_tabs->setTabEnabled(1, !update);
+        m_tabs->setTabEnabled(2, !update);
+    };
+    connect(m_srcType, &QComboBox::currentIndexChanged, this, [updateSourceTabs](int) { updateSourceTabs(); });
+    updateSourceTabs();
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     buttons->button(QDialogButtonBox::Ok)->setText(tr("Сохранить"));
@@ -77,6 +84,7 @@ QWidget *JobDialog::buildSourcePage() {
     m_srcType = new QComboBox;
     m_srcType->addItem(tr("Файлы и папки (локальные, сетевые, WebDAV)"), "files");
     m_srcType->addItem(tr("Файловая база 1С"), "one_c");
+    m_srcType->addItem(tr("Обновление конфигурации 1С"), "one_c_update");
     m_srcType->addItem(tr("База MS SQL Server"), "ms_sql");
     m_srcType->addItem(tr("База Firebird"), "firebird");
     m_srcType->addItem(tr("Базы PostgreSQL"), "postgresql");
@@ -162,6 +170,76 @@ QWidget *JobDialog::buildSourcePage() {
         f->addRow(tr("Код разрешения (/UC):"), m_onecUnlock);
         auto *hint = new QLabel(tr("Выгрузка .dt выполняется в режиме Конфигуратора. В это время в базе не должно быть "
                                    "активных пользователей, иначе выгрузка завершится ошибкой."));
+        hint->setWordWrap(true);
+        theme::markHint(hint);
+        f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+    { // Обновление конфигурации 1С
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        const auto directoryRow = [this](QLineEdit *edit, const QString &title) {
+            auto *browse = new QPushButton(tr("Обзор…"));
+            connect(browse, &QPushButton::clicked, this, [this, edit, title] {
+                const QString p = QFileDialog::getExistingDirectory(this, title, edit->text());
+                if (!p.isEmpty()) edit->setText(QDir::toNativeSeparators(p));
+            });
+            auto *row = new QWidget;
+            auto *l = new QHBoxLayout(row);
+            l->setContentsMargins(0, 0, 0, 0);
+            l->addWidget(edit, 1);
+            l->addWidget(browse);
+            return row;
+        };
+        m_onecUpdatePath = new QLineEdit;
+        m_onecUpdatePath->setPlaceholderText(QStringLiteral("C:\\1C\\Бухгалтерия  или  сервер\\имя"));
+        m_onecUpdateUpdatesDir = new QLineEdit;
+        m_onecUpdateUpdatesDir->setPlaceholderText(QStringLiteral("C:\\1C\\Updates"));
+        m_onecUpdateBackupDir = new QLineEdit;
+        m_onecUpdateBackupDir->setPlaceholderText(QStringLiteral("C:\\1C\\Backup"));
+        f->addRow(tr("База 1С:"), directoryRow(m_onecUpdatePath, tr("Каталог файловой базы 1С")));
+        f->addRow(tr("Папка обновлений:"), directoryRow(m_onecUpdateUpdatesDir, tr("Папка с обновлениями конфигурации")));
+        f->addRow(tr("Папка для .dt:"), directoryRow(m_onecUpdateBackupDir, tr("Папка для резервной копии .dt")));
+
+        m_onecUpdateExe = new QLineEdit;
+        m_onecUpdateExe->setPlaceholderText(tr("автоматически"));
+        m_client->call({{"cmd", "find1c"}}, [this](bool ok, const QJsonValue &r, const QString &) {
+            if (ok && r.isString()) m_onecUpdateExe->setPlaceholderText(tr("автоматически: %1").arg(r.toString()));
+        }, this);
+        auto *exeBrowse = new QPushButton(tr("Обзор…"));
+        connect(exeBrowse, &QPushButton::clicked, this, [this] {
+            const QString p = QFileDialog::getOpenFileName(this, tr("1cv8.exe"), m_onecUpdateExe->text(), tr("Программы (*.exe)"));
+            if (!p.isEmpty()) m_onecUpdateExe->setText(QDir::toNativeSeparators(p));
+        });
+        auto *exeRow = new QWidget;
+        auto *exeLayout = new QHBoxLayout(exeRow);
+        exeLayout->setContentsMargins(0, 0, 0, 0);
+        exeLayout->addWidget(m_onecUpdateExe, 1);
+        exeLayout->addWidget(exeBrowse);
+        m_onecUpdateConn = new ConnectionPicker(m_client, "one_c", tr("без пароля (пользователь по умолчанию)"));
+        m_onecUpdateUnlock = new QLineEdit;
+        m_onecUpdateUnlock->setPlaceholderText(tr("если включена блокировка сеансов"));
+        m_onecUpdateClusterUser = new QLineEdit;
+        m_onecUpdateClusterPassword = new PasswordEdit;
+        m_onecUpdateForce = new QCheckBox(tr("Принудительное обновление"));
+        m_onecUpdateServerSide = new QCheckBox(tr("Реструктуризация на сервере 1С"));
+        m_onecUpdateRunHandlers = new QCheckBox(tr("Выполнять обработчики обновления"));
+        f->addRow(tr("Пользователь 1С:"), m_onecUpdateConn);
+        f->addRow(tr("1cv8.exe:"), exeRow);
+        f->addRow(tr("Код разрешения (/UC):"), m_onecUpdateUnlock);
+        f->addRow(tr("Администратор кластера:"), m_onecUpdateClusterUser);
+        f->addRow(tr("Пароль кластера:"), m_onecUpdateClusterPassword);
+        auto *clusterHint = new QLabel(tr("Нужны только для серверных баз, если кластер требует отдельную аутентификацию администратора RAC."));
+        clusterHint->setWordWrap(true);
+        theme::markHint(clusterHint);
+        f->addRow(clusterHint);
+        f->addRow(m_onecUpdateForce);
+        f->addRow(m_onecUpdateServerSide);
+        f->addRow(m_onecUpdateRunHandlers);
+        auto *hint = new QLabel(tr("Сначала проверяется наличие обновления. Если оно найдено, новые сеансы блокируются через COM, "
+                                   "активные завершаются через RAC (серверная база) или завершением локальных процессов этой базы, "
+                                   "резервная копия .dt сохраняется в указанную папку, затем обновляется конфигурация. "
+                                   "Назначения и архивирование для этого типа задания не используются."));
         hint->setWordWrap(true);
         theme::markHint(hint);
         f->addRow(hint);
@@ -815,6 +893,18 @@ void JobDialog::load(const QJsonObject &job) {
         m_onecConn->setSource(s);
         m_onecMode->setCurrentIndex(indexOfData(m_onecMode, s.value("mode").toString("dump_dt")));
         m_onecUnlock->setText(s.value("unlock_code").toString());
+    } else if (st == "one_c_update") {
+        m_onecUpdatePath->setText(s.value("ib_path").toString());
+        m_onecUpdateUpdatesDir->setText(s.value("updates_dir").toString());
+        m_onecUpdateBackupDir->setText(s.value("backup_dir").toString());
+        m_onecUpdateExe->setText(s.value("platform_exe").toString());
+        m_onecUpdateConn->setSource(s);
+        m_onecUpdateUnlock->setText(s.value("unlock_code").toString());
+        m_onecUpdateClusterUser->setText(s.value("cluster_user").toString());
+        m_onecUpdateClusterPassword->setStored(s.value("cluster_password").toString());
+        m_onecUpdateForce->setChecked(s.value("force").toBool(false));
+        m_onecUpdateServerSide->setChecked(s.value("server_side").toBool(false));
+        m_onecUpdateRunHandlers->setChecked(s.value("run_handlers").toBool(false));
     } else if (st == "ms_sql") {
         m_sqlConn->setSource(s);
         QStringList dbs;
@@ -987,6 +1077,18 @@ QJsonObject JobDialog::value() const {
         m_onecConn->apply(s);
         s["mode"] = m_onecMode->currentData().toString();
         s["unlock_code"] = optString(m_onecUnlock->text());
+    } else if (st == "one_c_update") {
+        s[QStringLiteral("ib_path")] = m_onecUpdatePath->text().trimmed();
+        s[QStringLiteral("updates_dir")] = m_onecUpdateUpdatesDir->text().trimmed();
+        s[QStringLiteral("backup_dir")] = m_onecUpdateBackupDir->text().trimmed();
+        s[QStringLiteral("platform_exe")] = optString(m_onecUpdateExe->text());
+        m_onecUpdateConn->apply(s);
+        s[QStringLiteral("unlock_code")] = optString(m_onecUpdateUnlock->text());
+        s[QStringLiteral("cluster_user")] = optString(m_onecUpdateClusterUser->text());
+        s[QStringLiteral("cluster_password")] = optString(m_onecUpdateClusterPassword->value().toString());
+        s[QStringLiteral("force")] = m_onecUpdateForce->isChecked();
+        s[QStringLiteral("server_side")] = m_onecUpdateServerSide->isChecked();
+        s[QStringLiteral("run_handlers")] = m_onecUpdateRunHandlers->isChecked();
     } else if (st == "ms_sql") {
         m_sqlConn->apply(s);
         const QStringList dbs = dbChecked(m_sqlDatabases);
@@ -1122,6 +1224,12 @@ QString JobDialog::validate(int *tab) const {
     const QString st = s.value("type").toString();
     if (st == "files" && s.value("paths").toArray().isEmpty()) return at(0, tr("Укажите хотя бы одну папку-источник."));
     if (st == "one_c" && s.value("ib_path").toString().isEmpty()) return at(0, tr("Укажите каталог базы 1С."));
+    if (st == "one_c_update" && s.value("ib_path").toString().isEmpty())
+        return at(0, tr("Укажите каталог файловой базы 1С или сервер и имя базы."));
+    if (st == "one_c_update" && s.value("updates_dir").toString().isEmpty())
+        return at(0, tr("Укажите папку с обновлениями конфигурации 1С."));
+    if (st == "one_c_update" && s.value("backup_dir").toString().isEmpty())
+        return at(0, tr("Укажите папку для резервной копии .dt."));
     if (st == "ms_sql" && ((s.value("server").toString().isEmpty() && s.value("connection").toString().isEmpty()) ||
                            s.value("backup_dir").toString().isEmpty()))
         return at(0, tr("Укажите сервер и папку для .bak."));
@@ -1140,7 +1248,8 @@ QString JobDialog::validate(int *tab) const {
     if (st == "ssh_files" && s.value("paths").toArray().isEmpty())
         return at(0, tr("Укажите хотя бы один каталог на сервере."));
     if (st == "hyper_v" && s.value("vm_name").toString().isEmpty()) return at(0, tr("Укажите имя виртуальной машины."));
-    if (j.value("destinations").toArray().isEmpty()) return at(1, tr("Добавьте хотя бы одно назначение."));
+    if (st != "one_c_update" && j.value("destinations").toArray().isEmpty())
+        return at(1, tr("Добавьте хотя бы одно назначение."));
     const QJsonObject sc = j.value("schedule").toObject();
     const QString t = sc.value("type").toString();
     if ((t == "daily" || t == "weekly" || t == "monthly") && sc.value("times").toArray().isEmpty())

@@ -368,14 +368,18 @@ impl Engine {
             details.push(e.clone());
         }
         if let Some(r) = &h.report {
-            let kind = match r.kind {
-                steady_core::BackupKind::Full => "полная",
-                steady_core::BackupKind::Incremental => "инкрементная",
-                steady_core::BackupKind::Differential => "дифференциальная",
-            };
-            details.push(format!("Копия: {} ({kind})", r.set_name));
-            details.push(format!("Объём данных: {}, файлов: {}", fmt_bytes(r.bytes), r.items));
-            details.push(format!("Сохранено в назначений: {}", r.destinations_ok));
+            if r.skipped {
+                details.push("Подходящих обновлений 1С не найдено: сеансы не блокировались, копия не создавалась".into());
+            } else {
+                let kind = match r.kind {
+                    steady_core::BackupKind::Full => "полная",
+                    steady_core::BackupKind::Incremental => "инкрементная",
+                    steady_core::BackupKind::Differential => "дифференциальная",
+                };
+                details.push(format!("Копия: {} ({kind})", r.set_name));
+                details.push(format!("Объём данных: {}, файлов: {}", fmt_bytes(r.bytes), r.items));
+                details.push(format!("Сохранено в назначений: {}", r.destinations_ok));
+            }
         }
         details.extend(h.warnings.iter().map(|w| format!("⚠ {w}")));
         let ev = Event { job: h.job.clone(), outcome, started: h.started, finished: h.finished, details };

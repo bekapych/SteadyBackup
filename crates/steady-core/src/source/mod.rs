@@ -4,6 +4,7 @@ pub mod hyperv;
 pub mod mssql;
 pub mod mysql;
 pub mod onec;
+pub mod onec_update;
 pub mod postgres;
 pub mod sshfiles;
 pub mod vss;
@@ -179,6 +180,9 @@ pub fn prepare(
             state,
             staging,
         ),
+        Source::OneCUpdate { .. } => Err(anyhow::anyhow!(
+            "обновление 1С выполняется отдельной веткой конвейера, без staging"
+        )),
         Source::HyperV { vm_name, kind, full_every, consistency } => hyperv::prepare(
             &hyperv::HyperVParams { vm_name, kind: *kind, full_every: *full_every, consistency: *consistency, timeout },
             state,

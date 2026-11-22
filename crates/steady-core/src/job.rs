@@ -99,7 +99,7 @@ impl Source {
     pub fn default_timeout(&self) -> std::time::Duration {
         let hours = match self {
             // Выгрузка .dt даже больших файловых баз занимает минуты–десятки минут.
-            Source::OneC { .. } => 3,
+            Source::OneC { .. } | Source::OneCUpdate { .. } => 3,
             Source::MsSql { .. } | Source::Firebird { .. } | Source::PostgreSql { .. } | Source::MySql { .. } => 6,
             // Экспорт ВМ на сотни гигабайт.
             Source::HyperV { .. } => 12,
@@ -127,6 +127,10 @@ impl Job {
             | Source::MsSql { password, .. }
             | Source::Firebird { password, .. }
             | Source::PostgreSql { password, .. } => p(password)?,
+            Source::OneCUpdate { password, cluster_password, .. } => {
+                p(password)?;
+                p(cluster_password)?;
+            }
             Source::MySql { ssh, db_password, .. } => {
                 p(db_password)?;
                 if let Some(s) = ssh {
@@ -155,6 +159,10 @@ impl Job {
             | Source::MsSql { password, .. }
             | Source::Firebird { password, .. }
             | Source::PostgreSql { password, .. } => reveal_opt(password)?,
+            Source::OneCUpdate { password, cluster_password, .. } => {
+                reveal_opt(password)?;
+                reveal_opt(cluster_password)?;
+            }
             Source::MySql { ssh, db_password, .. } => {
                 reveal_opt(db_password)?;
                 if let Some(s) = ssh {
@@ -351,6 +359,44 @@ pub enum Source {
         /// Код разрешения запуска (/UC) при установленной блокировке сеансов.
         #[serde(default)]
         unlock_code: Option<String>,
+    },
+    /// Обновление конфигурации 1С из локальных дистрибутивов с постоянной выгрузкой .dt.
+    OneCUpdate {
+        /// Каталог файловой информационной базы или `сервер\имя_базы`.
+        ib_path: String,
+        /// Корневой каталог дистрибутивов обновлений (.mft, UpdInfo.txt, .cfu, .cf).
+        updates_dir: String,
+        /// Каталог постоянного хранения выгрузки .dt, созданной перед обновлением.
+        backup_dir: String,
+        /// Путь к 1cv8.exe. Если пусто — используется последняя установленная платформа.
+        #[serde(default)]
+        platform_exe: Option<String>,
+        /// Подключение типа `one_c` (пользователь и пароль информационной базы).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection: Option<String>,
+        #[serde(default)]
+        user: Option<String>,
+        /// Пароль информационной базы (DPAPI).
+        #[serde(default)]
+        password: Option<String>,
+        /// Код разрешения запуска (/UC) при установленной блокировке сеансов.
+        #[serde(default)]
+        unlock_code: Option<String>,
+        /// Передать `-force` команде `/UpdateCfg`.
+        #[serde(default)]
+        force: bool,
+        /// Обновлять конфигурацию базы данных на сервере (`/UpdateDBCfg -Server`).
+        #[serde(default)]
+        server_side: bool,
+        /// После обновления выполнить обработчики БСП через COM или ENTERPRISE.
+        #[serde(default)]
+        run_handlers: bool,
+        /// Отдельный администратор кластера для RAC, если он отличается от пользователя базы.
+        #[serde(default)]
+        cluster_user: Option<String>,
+        /// Пароль администратора кластера (DPAPI).
+        #[serde(default)]
+        cluster_password: Option<String>,
     },
     MsSql {
         /// Подключение (сервер, логин, пароль). Если задано — поля ниже не используются.

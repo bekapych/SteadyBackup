@@ -45,15 +45,24 @@ pub struct RunReport {
     /// Предупреждения источника (копия создана).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Подходящей цепочки обновления не было: успешный no-op без копии и назначений.
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 pub fn run_job(ctx: &RunContext, job: &Job) -> Result<RunReport> {
-    if job.destinations.is_empty() {
-        bail!("в задании нет назначений");
-    }
     // Дочерние процессы и обход файлов на этом потоке видят тот же флаг.
     let _cancel = crate::process::enter_cancel(ctx.cancel.clone());
     ctx.cancel.check()?;
+    // Обновление 1С не является резервным набором: ветка строго до требования назначений,
+    // загрузки состояния, staging и 7-Zip. Общие attempts к ней не применяются.
+    if matches!(job.source, Source::OneCUpdate { .. }) {
+        let src = crate::resources::Resources::new(&ctx.data_dir).resolve_source(&job.source)?;
+        return source::onec_update::run(ctx, job, &src);
+    }
+    if job.destinations.is_empty() {
+        bail!("в задании нет назначений");
+    }
     let state = ctx.state.load(&job.id)?;
     let run_dir = ctx.work_dir.join(format!("{}_{}", job.id, uuid::Uuid::new_v4().simple()));
     let staging = run_dir.join("staging");
@@ -234,6 +243,7 @@ pub fn run_job(ctx: &RunContext, job: &Job) -> Result<RunReport> {
         destinations_ok: ok,
         errors,
         warnings,
+        skipped: false,
     })
 }
 
