@@ -368,7 +368,16 @@ impl Engine {
             details.push(e.clone());
         }
         if let Some(r) = &h.report {
-            if r.skipped {
+            if Self::is_download_job(&self.store, h.job_id) {
+                // Загрузка обновлений 1С: набор копии не создаётся, `set_name` описывает
+                // результат («скачано N файлов», «новых файлов нет», «проверка без скачивания»).
+                details.push(format!("Обновления 1С: {}", r.set_name));
+                if r.skipped {
+                    details.push("Ничего не скачано: файлов обновлений в этом запуске нет".into());
+                } else {
+                    details.push(format!("Объём скачанного: {}, файлов: {}", fmt_bytes(r.bytes), r.items));
+                }
+            } else if r.skipped {
                 details.push("Подходящих обновлений 1С не найдено: сеансы не блокировались, копия не создавалась".into());
             } else {
                 let kind = match r.kind {
@@ -388,6 +397,15 @@ impl Engine {
                 tracing::error!("уведомление: {err}");
             }
         });
+    }
+
+    /// Задание загружает обновления 1С (а не делает копию): у него своя форма отчёта.
+    fn is_download_job(store: &steady_core::store::Store, id: uuid::Uuid) -> bool {
+        store
+            .load_jobs()
+            .unwrap_or_default()
+            .into_iter()
+            .any(|j| j.id == id && matches!(j.source, steady_core::Source::OneCDownload { .. }))
     }
 
     fn scheduler(self: Arc<Self>) {

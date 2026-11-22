@@ -99,7 +99,7 @@ impl Source {
     pub fn default_timeout(&self) -> std::time::Duration {
         let hours = match self {
             // Выгрузка .dt даже больших файловых баз занимает минуты–десятки минут.
-            Source::OneC { .. } | Source::OneCUpdate { .. } => 3,
+            Source::OneC { .. } | Source::OneCUpdate { .. } | Source::OneCDownload { .. } => 3,
             Source::MsSql { .. } | Source::Firebird { .. } | Source::PostgreSql { .. } | Source::MySql { .. } => 6,
             // Экспорт ВМ на сотни гигабайт.
             Source::HyperV { .. } => 12,
@@ -130,6 +130,14 @@ impl Job {
             Source::OneCUpdate { password, cluster_password, .. } => {
                 p(password)?;
                 p(cluster_password)?;
+            }
+            Source::OneCDownload { proxy, its_accounts, .. } => {
+                if let Some(proxy) = proxy {
+                    proxy.protect_secrets()?;
+                }
+                for a in its_accounts.iter_mut() {
+                    a.protect_secrets()?;
+                }
             }
             Source::MySql { ssh, db_password, .. } => {
                 p(db_password)?;
@@ -162,6 +170,14 @@ impl Job {
             Source::OneCUpdate { password, cluster_password, .. } => {
                 reveal_opt(password)?;
                 reveal_opt(cluster_password)?;
+            }
+            Source::OneCDownload { proxy, its_accounts, .. } => {
+                if let Some(proxy) = proxy {
+                    proxy.reveal_secrets()?;
+                }
+                for a in its_accounts.iter_mut() {
+                    a.reveal_secrets()?;
+                }
             }
             Source::MySql { ssh, db_password, .. } => {
                 reveal_opt(db_password)?;
@@ -398,6 +414,41 @@ pub enum Source {
         #[serde(default)]
         cluster_password: Option<String>,
     },
+    /// Загрузка обновлений платформы и конфигураций 1С с сайтов обновлений (нужна учётная
+    /// запись ИТС). Каталоги постоянные: скачанное остаётся на диске для установки.
+    OneCDownload {
+        /// Куда складывать обновления конфигураций: `<template_dir>\<templatePath>\1cv8.zip`
+        /// (`templatePath` приходит из сервиса и повторяет структуру каталога шаблонов).
+        /// Обязательный абсолютный путь.
+        template_dir: String,
+        /// Куда складывать архив платформы из сервиса (`<версия>.zip`) и дистрибутивы
+        /// с releases.1c.ru (`<версия>\<файл>`). Обязательный абсолютный путь.
+        platform_dir: String,
+        /// Распаковывать скачанный `1cv8.zip` в тот же каталог.
+        #[serde(default)]
+        unzip_files: bool,
+        /// Не проверять TLS-сертификаты сервисов 1С (например, при подмене сертификата прокси).
+        #[serde(default)]
+        insecure_tls: bool,
+        /// Только проверить и записать в журнал, что нашлось; ничего не скачивать.
+        #[serde(default)]
+        check_only: bool,
+        /// Прокси для обращения к сервисам 1С.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy: Option<DownloadProxy>,
+        /// Учётные записи ИТС. Нужна хотя бы одна.
+        #[serde(default)]
+        its_accounts: Vec<ItsAccount>,
+        /// Проверка обновления платформы через сервис обновлений 1С.
+        #[serde(default)]
+        platform: DownloadPlatform,
+        /// Дистрибутивы платформы с releases.1c.ru.
+        #[serde(default)]
+        releases: DownloadReleases,
+        /// Конфигурации, обновления которых скачиваются.
+        #[serde(default)]
+        configurations: Vec<DownloadConfig>,
+    },
     MsSql {
         /// Подключение (сервер, логин, пароль). Если задано — поля ниже не используются.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -594,6 +645,179 @@ impl SshLogin {
 
 fn full_kind() -> BackupKind {
     BackupKind::Full
+}
+
+/// Прокси для обращений к сервисам обновлений 1С.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DownloadProxy {
+    /// Имя или IP прокси. Пусто — прокси не используется.
+    #[serde(default)]
+    pub host: String,
+    /// Порт. Не задан — порт по умолчанию для схемы (http без порта использует 80).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Пользователь для basic-авторизации на прокси.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Пароль прокси (DPAPI). В журнал, ошибки и уведомления не попадает.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl DownloadProxy {
+    /// URL прокси для HTTP-клиента или `None`, если прокси не задан.
+    ///
+    /// Пароль хранится в DPAPI и расшифровывается здесь же: в заголовок прокси-авторизации
+    /// должен уйти открытый текст, а не шифротекст `dpapi:...`. Логин и пароль
+    /// percent-кодируются — иначе `@`, `:` и пробелы в них ломают разбор URL.
+    /// Возвращаемое значение содержит пароль: печатать его нельзя.
+    pub fn url(&self) -> anyhow::Result<Option<String>> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Ok(None);
+        }
+        let host_port = match self.port {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        let user = self.username.as_deref().unwrap_or("").trim();
+        if user.is_empty() {
+            return Ok(Some(format!("http://{host_port}")));
+        }
+        let password = crate::secret::reveal_opt(self.password.as_deref())?.unwrap_or_default();
+        let encode = |v: &str| {
+            percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC).to_string()
+        };
+        Ok(Some(format!(
+            "http://{}:{}@{host_port}",
+            encode(user),
+            encode(&password)
+        )))
+    }
+
+    pub fn protect_secrets(&mut self) -> anyhow::Result<()> {
+        protect_opt(&mut self.password)
+    }
+
+    pub fn reveal_secrets(&mut self) -> anyhow::Result<()> {
+        reveal_opt(&mut self.password)
+    }
+}
+
+/// Учётная запись портала ИТС: вход на login.1c.ru и обращения к сервису обновлений.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ItsAccount {
+    /// Имя учётной записи в задании. По нему разделы «Платформа», «Дистрибутивы»
+    /// и «Конфигурации» выбирают свою запись; пусто — используется первая из списка.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Логин ИТС.
+    #[serde(default)]
+    pub username: String,
+    /// Пароль ИТС (DPAPI). В журнал, ошибки и уведомления не попадает.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl ItsAccount {
+    /// Имя для журнала: заданное или первая запись по умолчанию.
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or("default")
+    }
+
+    pub fn protect_secrets(&mut self) -> anyhow::Result<()> {
+        protect_opt(&mut self.password)
+    }
+
+    pub fn reveal_secrets(&mut self) -> anyhow::Result<()> {
+        reveal_opt(&mut self.password)
+    }
+}
+
+/// Проверка обновления платформы через сервис обновлений 1С.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DownloadPlatform {
+    /// Версия платформы, от которой ищется обновление. Используется, пока в состоянии
+    /// задания нет скачанной версии.
+    #[serde(default)]
+    pub start_version: String,
+    /// Имя учётной записи ИТС (`ItsAccount::name`); пусто — первая из `its_accounts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub its_account: Option<String>,
+}
+
+/// Дистрибутивы платформы с releases.1c.ru.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadReleases {
+    /// Скачивать дистрибутивы последних версий.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Имя учётной записи ИТС; не задано — запись раздела «Платформа» или первая из списка.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub its_account: Option<String>,
+    /// Сколько последних версий (по дате выхода среди всех `projects`) держать скачанными.
+    #[serde(default = "download_release_count")]
+    pub count: usize,
+    /// Ленты платформы на портале (nick проекта).
+    #[serde(default = "download_release_projects")]
+    pub projects: Vec<String>,
+    /// Точные названия дистрибутивов со страницы версии.
+    #[serde(default = "download_release_distributions")]
+    pub distributions: Vec<String>,
+}
+
+impl Default for DownloadReleases {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            its_account: None,
+            count: download_release_count(),
+            projects: download_release_projects(),
+            distributions: download_release_distributions(),
+        }
+    }
+}
+
+fn download_release_count() -> usize {
+    2
+}
+
+fn download_release_projects() -> Vec<String> {
+    vec!["Platform83".into(), "Platform85".into()]
+}
+
+/// Три дистрибутива, которые забираются всегда: платформа 64-bit, платформа x86 и тонкий клиент.
+fn download_release_distributions() -> Vec<String> {
+    vec![
+        "Технологическая платформа 1С:Предприятия (64-bit) для Windows".into(),
+        "Технологическая платформа 1С:Предприятия для Windows".into(),
+        "Тонкий клиент 1С:Предприятия для Windows".into(),
+    ]
+}
+
+/// Конфигурация, обновления которой скачиваются в каталог шаблонов.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadConfig {
+    /// Название для человека (журнал, сообщения, состояние).
+    #[serde(default)]
+    pub human_name: String,
+    /// Имя программы в сервисе обновлений (`programName`), например `Accounting`.
+    pub program_name: String,
+    /// Версия, от которой ищется обновление, пока в состоянии ничего нет.
+    #[serde(default)]
+    pub start_version: String,
+    /// Имя учётной записи ИТС; пусто — первая из `its_accounts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub its_account: Option<String>,
+}
+
+/// Название конфигурации для журнала: «Бухгалтерия (Accounting)» или только `program_name`.
+pub fn download_config_title(c: &DownloadConfig) -> String {
+    if c.human_name.trim().is_empty() {
+        c.program_name.clone()
+    } else {
+        format!("{} ({})", c.human_name.trim(), c.program_name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

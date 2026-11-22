@@ -114,6 +114,8 @@ impl Store {
         }
         // Порядок группы с удалённым заданием не ломает: неизвестные id при запуске пропускаются.
         let _ = std::fs::remove_file(self.dir.join("state").join(format!("{id}.json")));
+        // Состояние загрузки обновлений 1С живёт отдельным файлом.
+        let _ = std::fs::remove_file(self.dir.join("state").join(format!("{id}.download.json")));
         Ok(())
     }
 

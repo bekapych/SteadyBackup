@@ -43,7 +43,9 @@ enum Request {
     Status,
     ListJobs,
     GetJob { job_id: Uuid },
-    SaveJob { job: Job },
+    /// Задание в Box: Source с настройками загрузки обновлений 1С заметно увеличил вариант,
+    /// а запросов этого вида за сеанс единицы.
+    SaveJob { job: Box<Job> },
     DeleteJob { job_id: Uuid },
     RunJob { job_id: Uuid },
     /// Снять выполняющееся задание или убрать его из очереди.
@@ -405,7 +407,8 @@ fn dispatch(engine: &Arc<Engine>, raw: Value, admin: bool) -> Result<Value> {
             let job = engine.store.load_jobs()?.into_iter().find(|j| j.id == job_id).context("задание не найдено")?;
             serde_json::to_value(job)?
         }
-        Request::SaveJob { mut job } => {
+        Request::SaveJob { job } => {
+            let mut job = *job;
             if job.name.trim().is_empty() {
                 bail!("не задано имя задания");
             }
@@ -950,6 +953,7 @@ fn source_kind(j: &Job) -> &'static str {
         steady_core::Source::Files { .. } => "files",
         steady_core::Source::OneC { .. } => "one_c",
         steady_core::Source::OneCUpdate { .. } => "one_c_update",
+        steady_core::Source::OneCDownload { .. } => "one_c_download",
         steady_core::Source::MsSql { .. } => "ms_sql",
         steady_core::Source::HyperV { .. } => "hyper_v",
         steady_core::Source::Firebird { .. } => "firebird",

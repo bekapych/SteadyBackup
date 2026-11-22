@@ -474,6 +474,8 @@ pub fn source_connection(s: &Source) -> Option<&str> {
             connection.as_deref()
         }
         Source::HyperV { .. } => None,
+        // Учётные записи ИТС хранятся в самом задании: общего подключения у загрузки нет.
+        Source::OneCDownload { .. } => None,
     }
 }
 

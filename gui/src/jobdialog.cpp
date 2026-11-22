@@ -16,6 +16,7 @@
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
@@ -27,11 +28,74 @@
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QTabWidget>
+#include <QTableWidget>
 #include <QTimeEdit>
 #include <QUuid>
 #include <QVBoxLayout>
 
 static const char *kDays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+
+// Значения по умолчанию источника one_c_download повторяют формат Autoupdate:
+// служба получает те же проекты и дистрибутивы, что и прежняя утилита.
+static QStringList defaultDlProjects() {
+    return {QStringLiteral("Platform83"), QStringLiteral("Platform85")};
+}
+
+static QStringList defaultDlDistributions() {
+    return {QStringLiteral("Технологическая платформа 1С:Предприятия (64-bit) для Windows"),
+            QStringLiteral("Технологическая платформа 1С:Предприятия для Windows"),
+            QStringLiteral("Тонкий клиент 1С:Предприятия для Windows")};
+}
+
+// Учётная запись ИТС: имя, логин, пароль. Сохранённый пароль возвращается маркером dpapi:stored,
+// если поле не трогали: служба по маркеру понимает, что пароль менять не нужно.
+static bool itsAccountDialog(QWidget *parent, QJsonObject &account) {
+    QDialog dlg(parent);
+    dlg.setWindowTitle(QObject::tr("Учётная запись ИТС"));
+    auto *name = new QLineEdit(account.value("name").toString());
+    name->setPlaceholderText(QObject::tr("напр. основная"));
+    auto *user = new QLineEdit(account.value("username").toString());
+    user->setPlaceholderText(QObject::tr("логин на releases.1c.ru"));
+    auto *password = new PasswordEdit;
+    password->setStored(account.value("password").toString());
+    auto *f = new QFormLayout;
+    f->addRow(QObject::tr("Имя:"), name);
+    f->addRow(QObject::tr("Логин:"), user);
+    f->addRow(QObject::tr("Пароль:"), password);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    buttons->button(QDialogButtonBox::Ok)->setText(QObject::tr("Сохранить"));
+    buttons->button(QDialogButtonBox::Cancel)->setText(QObject::tr("Отмена"));
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    auto *v = new QVBoxLayout(&dlg);
+    v->addLayout(f);
+    v->addWidget(buttons);
+    util::keepButtonsOnScreen(&dlg);
+    if (dlg.exec() != QDialog::Accepted) return false;
+    const QJsonValue loadedPassword = account.value("password");
+    account["name"] = name->text().trimmed();
+    account["username"] = user->text().trimmed();
+    const QJsonValue p = password->value();
+    // Маркер dpapi:stored означает «пароль не менялся»: возвращаем значение из задания как есть,
+    // чтобы служба подставила сохранённый пароль, а заглушка не попала в файл.
+    if (p.toString() == QLatin1String("dpapi:stored") || p == loadedPassword) {
+        if (loadedPassword.isString() && !loadedPassword.toString().isEmpty())
+            account["password"] = loadedPassword;
+        else
+            account.remove(QStringLiteral("password"));
+    } else if (p.isNull()) {
+        account.remove(QStringLiteral("password")); // «×» — пароль удалён
+    } else {
+        account["password"] = p;
+    }
+    return true;
+}
+
+// Текст строки таблицы конфигураций (ячейка может быть ещё не создана).
+static QString tableCell(const QTableWidget *t, int row, int col) {
+    const QTableWidgetItem *it = t->item(row, col);
+    return it ? it->text().trimmed() : QString();
+}
 
 JobDialog::JobDialog(ServiceClient *client, const QJsonObject &job, QWidget *parent)
     : QDialog(parent), m_client(client), m_original(job) {
@@ -53,9 +117,11 @@ JobDialog::JobDialog(ServiceClient *client, const QJsonObject &job, QWidget *par
     tabs->addTab(buildArchivePage(), tr("Архив и хранение"));
     tabs->addTab(buildSchedulePage(), tr("Расписание"));
     const auto updateSourceTabs = [this] {
-        const bool update = m_srcType->currentData().toString() == QLatin1String("one_c_update");
-        m_tabs->setTabEnabled(1, !update);
-        m_tabs->setTabEnabled(2, !update);
+        const QString source = m_srcType->currentData().toString();
+        // У этих источников нет назначений и архива: они сами раскладывают файлы по папкам.
+        const bool local = source == QLatin1String("one_c_update") || source == QLatin1String("one_c_download");
+        m_tabs->setTabEnabled(1, !local);
+        m_tabs->setTabEnabled(2, !local);
     };
     connect(m_srcType, &QComboBox::currentIndexChanged, this, [updateSourceTabs](int) { updateSourceTabs(); });
     updateSourceTabs();
@@ -85,6 +151,7 @@ QWidget *JobDialog::buildSourcePage() {
     m_srcType->addItem(tr("Файлы и папки (локальные, сетевые, WebDAV)"), "files");
     m_srcType->addItem(tr("Файловая база 1С"), "one_c");
     m_srcType->addItem(tr("Обновление конфигурации 1С"), "one_c_update");
+    m_srcType->addItem(tr("Загрузка обновлений 1С"), "one_c_download");
     m_srcType->addItem(tr("База MS SQL Server"), "ms_sql");
     m_srcType->addItem(tr("База Firebird"), "firebird");
     m_srcType->addItem(tr("Базы PostgreSQL"), "postgresql");
@@ -243,6 +310,182 @@ QWidget *JobDialog::buildSourcePage() {
         hint->setWordWrap(true);
         theme::markHint(hint);
         f->addRow(hint);
+        m_srcPages->addWidget(w);
+    }
+    { // Загрузка обновлений 1С
+        auto *w = new QWidget;
+        auto *f = new QFormLayout(w);
+        const auto directoryRow = [this](QLineEdit *edit, const QString &title) {
+            auto *browse = new QPushButton(tr("Обзор…"));
+            connect(browse, &QPushButton::clicked, this, [this, edit, title] {
+                const QString p = QFileDialog::getExistingDirectory(this, title, edit->text());
+                if (!p.isEmpty()) edit->setText(QDir::toNativeSeparators(p));
+            });
+            auto *row = new QWidget;
+            auto *l = new QHBoxLayout(row);
+            l->setContentsMargins(0, 0, 0, 0);
+            l->addWidget(edit, 1);
+            l->addWidget(browse);
+            return row;
+        };
+        m_dlTemplateDir = new QLineEdit;
+        m_dlTemplateDir->setPlaceholderText(QStringLiteral("C:\\1C\\Updates"));
+        m_dlPlatformDir = new QLineEdit;
+        m_dlPlatformDir->setPlaceholderText(QStringLiteral("C:\\1C\\Platform"));
+        f->addRow(tr("Обновления конфигураций:"),
+                  directoryRow(m_dlTemplateDir, tr("Папка для обновлений конфигураций")));
+        f->addRow(tr("Платформа и дистрибутивы:"),
+                  directoryRow(m_dlPlatformDir, tr("Папка для платформы и дистрибутивов")));
+        m_dlTemplateDir->setToolTip(tr("Эту папку сможет использовать задание «Обновление конфигурации 1С»."));
+        m_dlUnzip = new QCheckBox(tr("Распаковывать архивы"));
+        m_dlInsecure = new QCheckBox(tr("Не проверять TLS-сертификат"));
+        m_dlCheckOnly = new QCheckBox(tr("Только проверять, не скачивать"));
+        f->addRow(m_dlUnzip);
+        f->addRow(m_dlInsecure);
+        f->addRow(m_dlCheckOnly);
+
+        auto *proxy = new QGroupBox(tr("Прокси"));
+        auto *pf = new QFormLayout(proxy);
+        m_dlProxyHost = new QLineEdit;
+        m_dlProxyHost->setPlaceholderText(tr("без прокси; напр. proxy.example.ru"));
+        m_dlProxyPort = new QSpinBox;
+        m_dlProxyPort->setRange(0, 65535);
+        m_dlProxyPort->setSpecialValueText(tr("по умолчанию"));
+        auto *hostRow = new QWidget;
+        auto *hl = new QHBoxLayout(hostRow);
+        hl->setContentsMargins(0, 0, 0, 0);
+        hl->addWidget(m_dlProxyHost, 1);
+        hl->addWidget(new QLabel(tr("порт:")));
+        hl->addWidget(m_dlProxyPort);
+        m_dlProxyUser = new QLineEdit;
+        m_dlProxyUser->setPlaceholderText(tr("если прокси требует вход"));
+        m_dlProxyPassword = new PasswordEdit;
+        pf->addRow(tr("Сервер:"), hostRow);
+        pf->addRow(tr("Пользователь:"), m_dlProxyUser);
+        pf->addRow(tr("Пароль:"), m_dlProxyPassword);
+        f->addRow(proxy);
+
+        auto *its = new QGroupBox(tr("Учётные записи ИТС"));
+        auto *il = new QHBoxLayout(its);
+        m_dlAccounts = new QListWidget;
+        m_dlAccounts->setMinimumHeight(80);
+        m_dlAccounts->setMaximumHeight(140);
+        m_dlAccounts->setToolTip(tr("Учётные записи для releases.1c.ru. Пароли на диске хранятся "
+                                    "зашифрованными (DPAPI), в списке пароль не показывается."));
+        auto *addAcc = new QPushButton(tr("Добавить…"));
+        auto *editAcc = new QPushButton(tr("Изменить…"));
+        auto *delAcc = new QPushButton(tr("Удалить"));
+        const auto editAccount = [this](int row) {
+            QJsonObject account = row >= 0 && row < m_dlAccountList.size() ? m_dlAccountList.at(row).toObject()
+                                                                          : QJsonObject{};
+            if (!itsAccountDialog(this, account)) return;
+            if (row >= 0 && row < m_dlAccountList.size())
+                m_dlAccountList.replace(row, account);
+            else
+                m_dlAccountList.append(account);
+            refreshItsAccounts();
+        };
+        connect(addAcc, &QPushButton::clicked, this, [editAccount] { editAccount(-1); });
+        connect(editAcc, &QPushButton::clicked, this, [this, editAccount] { editAccount(m_dlAccounts->currentRow()); });
+        connect(m_dlAccounts, &QListWidget::itemDoubleClicked, this,
+                [this, editAccount](QListWidgetItem *) { editAccount(m_dlAccounts->currentRow()); });
+        connect(delAcc, &QPushButton::clicked, this, [this] {
+            const int r = m_dlAccounts->currentRow();
+            if (r < 0 || r >= m_dlAccountList.size()) return;
+            m_dlAccountList.removeAt(r);
+            refreshItsAccounts();
+        });
+        auto *accButtons = new QVBoxLayout;
+        accButtons->addWidget(addAcc);
+        accButtons->addWidget(editAcc);
+        accButtons->addWidget(delAcc);
+        accButtons->addStretch();
+        il->addWidget(m_dlAccounts, 1);
+        il->addLayout(accButtons);
+        f->addRow(its);
+
+        auto *platformBox = new QGroupBox(tr("Платформа 1С"));
+        auto *plf = new QFormLayout(platformBox);
+        m_dlPlatformVersion = new QLineEdit;
+        m_dlPlatformVersion->setPlaceholderText(tr("напр. 8.3.24.1548"));
+        m_dlPlatformAccount = new SteadyCombo;
+        m_dlPlatformAccount->setToolTip(tr("Пусто — первая учётная запись ИТС из списка выше."));
+        plf->addRow(tr("Начальная версия:"), m_dlPlatformVersion);
+        plf->addRow(tr("Учётная запись:"), m_dlPlatformAccount);
+        f->addRow(platformBox);
+
+        auto *rel = new QGroupBox(tr("Выпуски и дистрибутивы с releases.1c.ru"));
+        auto *rf = new QFormLayout(rel);
+        m_dlReleasesEnabled = new QCheckBox(tr("Скачивать выпуски и дистрибутивы"));
+        m_dlReleasesAccount = new SteadyCombo;
+        m_dlReleasesAccount->setToolTip(tr("Пусто — первая учётная запись ИТС из списка выше."));
+        m_dlReleasesCount = new QSpinBox;
+        m_dlReleasesCount->setRange(1, 10);
+        m_dlReleasesCount->setValue(2);
+        m_dlReleasesCount->setSuffix(tr(" версий"));
+        m_dlReleasesCount->setToolTip(tr("Сколько последних версий скачивать за один запуск."));
+        m_dlReleasesProjects = new QLineEdit;
+        m_dlReleasesProjects->setPlaceholderText(QStringLiteral("Platform83,Platform85"));
+        m_dlDistributions = new QPlainTextEdit;
+        m_dlDistributions->setMinimumHeight(64);
+        m_dlDistributions->setMaximumHeight(120);
+        m_dlDistributions->setPlaceholderText(tr("По одному названию дистрибутива на строку"));
+        rf->addRow(m_dlReleasesEnabled);
+        rf->addRow(tr("Учётная запись:"), m_dlReleasesAccount);
+        rf->addRow(tr("Сколько последних версий:"), m_dlReleasesCount);
+        rf->addRow(tr("Проекты:"), m_dlReleasesProjects);
+        rf->addRow(tr("Дистрибутивы:"), m_dlDistributions);
+        for (QWidget *x : std::initializer_list<QWidget *>{m_dlReleasesAccount, m_dlReleasesCount, m_dlReleasesProjects,
+                                                           m_dlDistributions})
+            connect(m_dlReleasesEnabled, &QCheckBox::toggled, x, &QWidget::setEnabled);
+        m_dlReleasesEnabled->setChecked(true);
+        f->addRow(rel);
+
+        auto *cfg = new QGroupBox(tr("Конфигурации"));
+        auto *cl = new QHBoxLayout(cfg);
+        m_dlConfigurations = new QTableWidget(0, 4);
+        m_dlConfigurations->setHorizontalHeaderLabels(
+            {tr("Название"), tr("Программа"), tr("Начальная версия"), tr("Учётка")});
+        m_dlConfigurations->setSelectionBehavior(QAbstractItemView::SelectRows);
+        m_dlConfigurations->setShowGrid(false);
+        m_dlConfigurations->verticalHeader()->hide();
+        m_dlConfigurations->horizontalHeader()->setHighlightSections(false);
+        m_dlConfigurations->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        m_dlConfigurations->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+        m_dlConfigurations->setToolTip(tr("Учётка — имя из списка учётных записей ИТС; пусто — первая учётная запись."));
+        m_dlConfigurations->setMinimumHeight(110);
+        auto *addCfg = new QPushButton(tr("Добавить"));
+        auto *delCfg = new QPushButton(tr("Удалить"));
+        const auto addConfigRow = [this] {
+            const int r = m_dlConfigurations->rowCount();
+            m_dlConfigurations->insertRow(r);
+            for (int c = 0; c < 4; ++c) m_dlConfigurations->setItem(r, c, new QTableWidgetItem);
+            m_dlConfigurations->setCurrentCell(r, 0);
+            m_dlConfigurations->editItem(m_dlConfigurations->item(r, 0));
+        };
+        connect(addCfg, &QPushButton::clicked, this, addConfigRow);
+        connect(delCfg, &QPushButton::clicked, this, [this] {
+            const int r = m_dlConfigurations->currentRow();
+            if (r < 0) return;
+            m_dlConfigurations->removeRow(r);
+        });
+        auto *cfgButtons = new QVBoxLayout;
+        cfgButtons->addWidget(addCfg);
+        cfgButtons->addWidget(delCfg);
+        cfgButtons->addStretch();
+        cl->addWidget(m_dlConfigurations, 1);
+        cl->addLayout(cfgButtons);
+        f->addRow(cfg);
+
+        auto *hint = new QLabel(tr("Нужна учётная запись ИТС. Задание скачивает обновления конфигураций в папку "
+                                   "шаблонов (её сможет использовать задание «Обновление конфигурации 1С»), архив "
+                                   "платформы и дистрибутивы с releases.1c.ru. Состояние «последняя скачанная "
+                                   "версия» хранится службой, поэтому повторно те же файлы не скачиваются. "
+                                   "Назначения и архивирование для этого типа задания не используются."));
+        hint->setWordWrap(true);
+        theme::markHint(hint);
+        f->addRow(hint);
+        refreshItsAccounts();
         m_srcPages->addWidget(w);
     }
     { // MSSQL
@@ -905,6 +1148,47 @@ void JobDialog::load(const QJsonObject &job) {
         m_onecUpdateForce->setChecked(s.value("force").toBool(false));
         m_onecUpdateServerSide->setChecked(s.value("server_side").toBool(false));
         m_onecUpdateRunHandlers->setChecked(s.value("run_handlers").toBool(false));
+    } else if (st == "one_c_download") {
+        m_dlTemplateDir->setText(s.value("template_dir").toString());
+        m_dlPlatformDir->setText(s.value("platform_dir").toString());
+        m_dlUnzip->setChecked(s.value("unzip_files").toBool(false));
+        m_dlInsecure->setChecked(s.value("insecure_tls").toBool(false));
+        m_dlCheckOnly->setChecked(s.value("check_only").toBool(false));
+        const QJsonObject proxy = s.value("proxy").toObject();
+        m_dlProxyHost->setText(proxy.value("host").toString());
+        m_dlProxyPort->setValue(proxy.value("port").toInt(0));
+        m_dlProxyUser->setText(proxy.value("username").toString());
+        m_dlProxyPassword->setStored(proxy.value("password").toString());
+        m_dlAccountList = s.value("its_accounts").toArray();
+        refreshItsAccounts();
+        // Учётки могло не оказаться в списке (переименована): показываем её, чтобы не потерять при сохранении.
+        const auto selectAccount = [](QComboBox *combo, const QString &name) {
+            if (combo->findData(name) < 0) combo->addItem(name, name);
+            combo->setCurrentIndex(indexOfData(combo, name));
+        };
+        const QJsonObject platform = s.value("platform").toObject();
+        const QJsonObject releases = s.value("releases").toObject();
+        m_dlPlatformVersion->setText(platform.value("start_version").toString());
+        selectAccount(m_dlPlatformAccount, platform.value("its_account").toString());
+        m_dlReleasesEnabled->setChecked(releases.value("enabled").toBool(true));
+        selectAccount(m_dlReleasesAccount, releases.value("its_account").toString());
+        m_dlReleasesCount->setValue(releases.value("count").toInt(2));
+        m_dlReleasesProjects->setText(releases.contains("projects")
+                                          ? joinArray(releases.value("projects"), ", ")
+                                          : defaultDlProjects().join(QStringLiteral(", ")));
+        m_dlDistributions->setPlainText(releases.contains("distributions")
+                                            ? joinArray(releases.value("distributions"), "\n")
+                                            : defaultDlDistributions().join(QStringLiteral("\n")));
+        m_dlConfigurations->setRowCount(0);
+        for (const auto &v : s.value("configurations").toArray()) {
+            const QJsonObject c = v.toObject();
+            const int r = m_dlConfigurations->rowCount();
+            m_dlConfigurations->insertRow(r);
+            m_dlConfigurations->setItem(r, 0, new QTableWidgetItem(c.value("human_name").toString()));
+            m_dlConfigurations->setItem(r, 1, new QTableWidgetItem(c.value("program_name").toString()));
+            m_dlConfigurations->setItem(r, 2, new QTableWidgetItem(c.value("start_version").toString()));
+            m_dlConfigurations->setItem(r, 3, new QTableWidgetItem(c.value("its_account").toString()));
+        }
     } else if (st == "ms_sql") {
         m_sqlConn->setSource(s);
         QStringList dbs;
@@ -1089,6 +1373,58 @@ QJsonObject JobDialog::value() const {
         s[QStringLiteral("force")] = m_onecUpdateForce->isChecked();
         s[QStringLiteral("server_side")] = m_onecUpdateServerSide->isChecked();
         s[QStringLiteral("run_handlers")] = m_onecUpdateRunHandlers->isChecked();
+    } else if (st == "one_c_download") {
+        s[QStringLiteral("template_dir")] = m_dlTemplateDir->text().trimmed();
+        s[QStringLiteral("platform_dir")] = m_dlPlatformDir->text().trimmed();
+        s[QStringLiteral("unzip_files")] = m_dlUnzip->isChecked();
+        s[QStringLiteral("insecure_tls")] = m_dlInsecure->isChecked();
+        s[QStringLiteral("check_only")] = m_dlCheckOnly->isChecked();
+        // Пустой сервер — прокси не задан: ключ proxy в задании не создаём.
+        if (m_dlProxyHost->text().trimmed().isEmpty()) {
+            s.remove(QStringLiteral("proxy"));
+        } else {
+            QJsonObject proxy{
+                {QStringLiteral("host"), m_dlProxyHost->text().trimmed()},
+                {QStringLiteral("username"), m_dlProxyUser->text().trimmed()},
+                {QStringLiteral("password"), m_dlProxyPassword->value()},
+            };
+            // 0 в поле порта — порт по умолчанию: ключ не пишем, как у db_port других источников.
+            if (m_dlProxyPort->value() > 0) proxy[QStringLiteral("port")] = m_dlProxyPort->value();
+            s[QStringLiteral("proxy")] = proxy;
+        }
+        QJsonArray accounts;
+        for (const auto &v : std::as_const(m_dlAccountList)) accounts.append(v);
+        s[QStringLiteral("its_accounts")] = accounts;
+        s[QStringLiteral("platform")] = QJsonObject{
+            {QStringLiteral("start_version"), m_dlPlatformVersion->text().trimmed()},
+            {QStringLiteral("its_account"), m_dlPlatformAccount->currentData().toString()},
+        };
+        QStringList distributions;
+        for (const auto &d : m_dlDistributions->toPlainText().split('\n', Qt::SkipEmptyParts))
+            if (!d.trimmed().isEmpty()) distributions << d.trimmed();
+        s[QStringLiteral("releases")] = QJsonObject{
+            {QStringLiteral("enabled"), m_dlReleasesEnabled->isChecked()},
+            {QStringLiteral("its_account"), m_dlReleasesAccount->currentData().toString()},
+            {QStringLiteral("count"), m_dlReleasesCount->value()},
+            {QStringLiteral("projects"), toArray(util::splitList(m_dlReleasesProjects->text()))},
+            {QStringLiteral("distributions"), toArray(distributions)},
+        };
+        QJsonArray configurations;
+        for (int r = 0; r < m_dlConfigurations->rowCount(); ++r) {
+            const QString human = tableCell(m_dlConfigurations, r, 0);
+            const QString program = tableCell(m_dlConfigurations, r, 1);
+            const QString version = tableCell(m_dlConfigurations, r, 2);
+            const QString account = tableCell(m_dlConfigurations, r, 3);
+            // Пустая строка таблицы — не конфигурация: в JSON её не пишем.
+            if (human.isEmpty() && program.isEmpty() && version.isEmpty() && account.isEmpty()) continue;
+            configurations.append(QJsonObject{
+                {QStringLiteral("human_name"), human},
+                {QStringLiteral("program_name"), program},
+                {QStringLiteral("start_version"), version},
+                {QStringLiteral("its_account"), account},
+            });
+        }
+        s[QStringLiteral("configurations")] = configurations;
     } else if (st == "ms_sql") {
         m_sqlConn->apply(s);
         const QStringList dbs = dbChecked(m_sqlDatabases);
@@ -1230,6 +1566,22 @@ QString JobDialog::validate(int *tab) const {
         return at(0, tr("Укажите папку с обновлениями конфигурации 1С."));
     if (st == "one_c_update" && s.value("backup_dir").toString().isEmpty())
         return at(0, tr("Укажите папку для резервной копии .dt."));
+    if (st == "one_c_download" && s.value("template_dir").toString().isEmpty())
+        return at(0, tr("Укажите папку для обновлений конфигураций 1С."));
+    if (st == "one_c_download" && s.value("platform_dir").toString().isEmpty())
+        return at(0, tr("Укажите папку для платформы и дистрибутивов 1С."));
+    if (st == "one_c_download") {
+        // Без логина ИТС скачивать нечего: служба не сможет войти на releases.1c.ru.
+        bool hasLogin = false;
+        for (const auto &v : s.value("its_accounts").toArray())
+            if (!v.toObject().value("username").toString().trimmed().isEmpty()) {
+                hasLogin = true;
+                break;
+            }
+        if (!hasLogin)
+            return at(0, tr("Добавьте хотя бы одну учётную запись ИТС с логином — без неё обновления "
+                            "с releases.1c.ru не скачиваются."));
+    }
     if (st == "ms_sql" && ((s.value("server").toString().isEmpty() && s.value("connection").toString().isEmpty()) ||
                            s.value("backup_dir").toString().isEmpty()))
         return at(0, tr("Укажите сервер и папку для .bak."));
@@ -1248,7 +1600,7 @@ QString JobDialog::validate(int *tab) const {
     if (st == "ssh_files" && s.value("paths").toArray().isEmpty())
         return at(0, tr("Укажите хотя бы один каталог на сервере."));
     if (st == "hyper_v" && s.value("vm_name").toString().isEmpty()) return at(0, tr("Укажите имя виртуальной машины."));
-    if (st != "one_c_update" && j.value("destinations").toArray().isEmpty())
+    if (st != "one_c_update" && st != "one_c_download" && j.value("destinations").toArray().isEmpty())
         return at(1, tr("Добавьте хотя бы одно назначение."));
     const QJsonObject sc = j.value("schedule").toObject();
     const QString t = sc.value("type").toString();
@@ -1411,6 +1763,36 @@ void JobDialog::checkSshPaths() {
         m_sshStatus->setTextInteractionFlags(Qt::TextSelectableByMouse);
         theme::setState(m_sshStatus, bad.isEmpty() ? theme::Ok : theme::Warn);
     }, this);
+}
+
+void JobDialog::refreshItsAccounts() {
+    // Выбранные учётки сохраняем: список мог измениться из-за правки другой записи.
+    const QString prevPlatform = m_dlPlatformAccount->currentData().toString();
+    const QString prevReleases = m_dlReleasesAccount->currentData().toString();
+    m_dlAccounts->clear();
+    for (const auto &v : std::as_const(m_dlAccountList)) {
+        const QJsonObject a = v.toObject();
+        QString text = a.value("name").toString();
+        if (text.isEmpty()) text = tr("без имени");
+        const QString user = a.value("username").toString();
+        if (!user.isEmpty()) text += QStringLiteral("  ·  ") + user;
+        text += a.value("password").toString().isEmpty() ? tr("  ·  пароль не задан")
+                                                         : tr("  ·  пароль задан");
+        m_dlAccounts->addItem(text);
+    }
+    // Пустой пункт — «первая учётка в списке»: служба берёт её сама.
+    const auto fill = [this](QComboBox *combo, const QString &noneText, const QString &prev) {
+        combo->clear();
+        combo->addItem(noneText, QString());
+        for (const auto &v : std::as_const(m_dlAccountList)) {
+            const QString name = v.toObject().value("name").toString();
+            if (!name.isEmpty() && combo->findData(name) < 0) combo->addItem(name, name);
+        }
+        const int i = combo->findData(prev);
+        combo->setCurrentIndex(i >= 0 ? i : 0);
+    };
+    fill(m_dlPlatformAccount, tr("первая учётка"), prevPlatform);
+    fill(m_dlReleasesAccount, tr("первая из списка"), prevReleases);
 }
 
 void JobDialog::saveShots(const QString &dir, const QString &prefix) {

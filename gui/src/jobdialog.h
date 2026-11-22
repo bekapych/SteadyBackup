@@ -15,6 +15,7 @@ class QListWidget;
 class QPlainTextEdit;
 class QSpinBox;
 class QStackedWidget;
+class QTableWidget;
 class QTimeEdit;
 class ServiceClient;
 class PasswordEdit;
@@ -52,6 +53,8 @@ private:
     QComboBox *makeArchiveMode();
     // «Файлы по SSH»: вход на сервер и наличие каталогов.
     void checkSshPaths();
+    // Учётные записи ИТС: список в форме и пункты выбора учётки для платформы.
+    void refreshItsAccounts();
 
     ServiceClient *m_client;
     QJsonObject m_original;
@@ -80,6 +83,22 @@ private:
     PasswordEdit *m_onecUpdateClusterPassword;
     ConnectionPicker *m_onecUpdateConn;
     QCheckBox *m_onecUpdateForce, *m_onecUpdateServerSide, *m_onecUpdateRunHandlers;
+    // Загрузка обновлений 1С: каталоги, прокси, учётные записи ИТС, платформа, выпуски.
+    QLineEdit *m_dlTemplateDir, *m_dlPlatformDir;
+    QCheckBox *m_dlUnzip, *m_dlInsecure, *m_dlCheckOnly;
+    QLineEdit *m_dlProxyHost, *m_dlProxyUser;
+    QSpinBox *m_dlProxyPort; // 0 — порт по умолчанию
+    PasswordEdit *m_dlProxyPassword;
+    QListWidget *m_dlAccounts;
+    QJsonArray m_dlAccountList; // учётные записи ИТС: name, username, password (dpapi:stored)
+    QLineEdit *m_dlPlatformVersion;
+    QComboBox *m_dlPlatformAccount;
+    QCheckBox *m_dlReleasesEnabled;
+    QComboBox *m_dlReleasesAccount;
+    QSpinBox *m_dlReleasesCount;
+    QLineEdit *m_dlReleasesProjects;
+    QPlainTextEdit *m_dlDistributions;
+    QTableWidget *m_dlConfigurations;
     QListWidget *m_sqlDatabases; // отмеченные базы; ничего не отмечено — все пользовательские базы
     QComboBox *m_sqlArchives, *m_pgArchives; // данные: false — один архив, true — по архиву на базу
     QLineEdit *m_sqlDir;

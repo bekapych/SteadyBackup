@@ -81,6 +81,7 @@ QString sourceTitle(const QString &type) {
     if (type == QLatin1String("files")) return QObject::tr("Файлы");
     if (type == QLatin1String("one_c")) return QObject::tr("1С (файловая)");
     if (type == QLatin1String("one_c_update")) return QObject::tr("Обновление конфигурации 1С");
+    if (type == QLatin1String("one_c_download")) return QObject::tr("Загрузка обновлений 1С");
     if (type == QLatin1String("ms_sql")) return QObject::tr("MS SQL");
     if (type == QLatin1String("hyper_v")) return QObject::tr("Hyper-V");
     if (type == QLatin1String("firebird")) return QObject::tr("Firebird");

@@ -16,7 +16,10 @@ tracing.workspace = true
 tokio = { version = "1", features = ["rt", "io-util", "fs", "net", "time"] }
 russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "3"
-ureq = { version = "3", features = ["json"] }
+ureq = { version = "3", features = ["json", "cookies", "native-tls"] }
+regex.workspace = true
+zip.workspace = true
+native-tls.workspace = true
 base64 = "0.22"
 percent-encoding = "2"
 rand = "0.9"

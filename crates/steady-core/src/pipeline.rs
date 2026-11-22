@@ -60,6 +60,11 @@ pub fn run_job(ctx: &RunContext, job: &Job) -> Result<RunReport> {
         let src = crate::resources::Resources::new(&ctx.data_dir).resolve_source(&job.source)?;
         return source::onec_update::run(ctx, job, &src);
     }
+    // Загрузка обновлений 1С — такие же постоянные файлы, а не набор копии.
+    if matches!(job.source, Source::OneCDownload { .. }) {
+        let src = crate::resources::Resources::new(&ctx.data_dir).resolve_source(&job.source)?;
+        return source::onec_download::run(ctx, job, &src);
+    }
     if job.destinations.is_empty() {
         bail!("в задании нет назначений");
     }
