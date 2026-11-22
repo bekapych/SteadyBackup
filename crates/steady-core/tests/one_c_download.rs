@@ -5,10 +5,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use steady_core::source::onec_download::{
-    decode_zip_name, list_available, parse_configuration_update, parse_conf_download,
-    parse_distributions, parse_download_links, parse_platform_update, parse_releases,
-    parse_total_programs, program_name_from_nick, relative_path, report, run_download,
-    select_account, unzip, AvailableConfiguration, DownloadState, Progress,
+    decode_zip_name, effective_platform_version, list_available, parse_configuration_update,
+    parse_conf_download, parse_distributions, parse_download_links, parse_platform_update,
+    parse_releases, parse_total_programs, program_name_from_nick, relative_path, report,
+    run_download, select_account, unzip, version_from_platform_path, AvailableConfiguration,
+    DownloadState, Progress,
 };
 use steady_core::{DownloadProxy, DownloadReleases, ItsAccount, Job, Source};
 
@@ -450,15 +451,23 @@ fn configuration_update_response_parsed() {
     let text = r#"{"configurationUpdateResponse":{"configurationVersion":"3.0.52.32","upgradeSequence":["a","b"],"programVersionUin":"prog-1"}}"#;
     let upd = parse_configuration_update(text).unwrap().expect("обновление");
     assert_eq!(upd.configuration_version.as_deref(), Some("3.0.52.32"));
-    assert_eq!(upd.upgrade_sequence, vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(upd.sequence(), vec!["a".to_string(), "b".to_string()]);
     assert_eq!(upd.program_version_uin.as_deref(), Some("prog-1"));
     // Пустой ответ: полей нет — значение по умолчанию, ошибки нет.
     let upd = parse_configuration_update(r#"{"configurationUpdateResponse":{}}"#)
         .unwrap()
         .expect("раздел есть");
     assert!(upd.configuration_version.is_none());
-    assert!(upd.upgrade_sequence.is_empty());
+    assert!(upd.sequence().is_empty());
     assert!(upd.program_version_uin.is_none());
+    // Сервис отвечает `"upgradeSequence": null`, когда обновления нет: это не ошибка разбора.
+    let upd = parse_configuration_update(
+        r#"{"configurationUpdateResponse":{"configurationVersion":null,"upgradeSequence":null,"programVersionUin":null}}"#,
+    )
+    .unwrap()
+    .expect("раздел есть");
+    assert!(upd.configuration_version.is_none());
+    assert!(upd.sequence().is_empty());
 }
 
 /// Данные звена цепочки и ошибка сервиса в `errorName`.
@@ -745,6 +754,23 @@ fn live_its_list() {
     for c in list.iter().take(8) {
         println!("{} | {} | {} | {}", c.group, c.name, c.program_name, c.version);
     }
+}
+
+/// Сервис отклоняет запрос с пустым `platformVersion` (HTTP 400 NotBlank). Версия берётся
+/// из задания, затем из установленной платформы; чужая структура пути не принимается.
+#[test]
+fn platform_version_falls_back_and_parses_install_path() {
+    let saved = "8.3.25.1394".to_string();
+    assert_eq!(effective_platform_version(Some(&saved), ""), "8.3.25.1394");
+    assert_eq!(effective_platform_version(None, " 8.3.24.1 "), "8.3.24.1");
+    assert_eq!(
+        version_from_platform_path(PathBuf::from(r"C:\Program Files\1cv8\8.3.27.2074\bin\1cv8.exe").as_path()),
+        Some("8.3.27.2074".to_string())
+    );
+    assert_eq!(
+        version_from_platform_path(PathBuf::from(r"C:\tools\1cv8\bin\1cv8.exe").as_path()),
+        None
+    );
 }
 
 /// Проверять нечего: запуск успешно пропускается, не обращаясь к сервисам.

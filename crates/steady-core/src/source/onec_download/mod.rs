@@ -302,6 +302,31 @@ fn client_for(
         .context("сервис обновлений 1С")
 }
 
+/// Версия платформы для запросов к сервису: скачанная ранее, затем заданная, затем версия
+/// установленной платформы. Сервис отклоняет запрос с пустым `platformVersion` (HTTP 400
+/// `NotBlank.platformVersion`), поэтому пустое значение нужно закрывать до запроса.
+pub fn effective_platform_version(saved: Option<&String>, start: &str) -> String {
+    let from_job = DownloadState::current(saved, start).trim();
+    if !from_job.is_empty() {
+        return from_job.to_string();
+    }
+    installed_platform_version().unwrap_or_default()
+}
+
+/// Версия установленной платформы 1С (новая из найденных `1cv8.exe`).
+pub fn installed_platform_version() -> Option<String> {
+    crate::source::onec::find_platform().and_then(|exe| version_from_platform_path(&exe))
+}
+
+/// Версия из пути `<каталог установки>\<версия>\bin\1cv8.exe`.
+pub fn version_from_platform_path(exe: &Path) -> Option<String> {
+    let dir = exe.parent()?.parent()?;
+    let name = dir.file_name()?.to_string_lossy().into_owned();
+    let parts: Vec<&str> = name.split('.').collect();
+    let numeric = parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    numeric.then_some(name)
+}
+
 /// Обновления конфигураций: проверка, цепочка звеньев и скачивание в каталог шаблонов.
 #[allow(clippy::too_many_arguments)]
 fn download_configurations(
@@ -343,7 +368,13 @@ fn download_configurations(
             }
         };
         let platform_version =
-            DownloadState::current(state.platform.as_ref(), &platform.start_version).to_string();
+            effective_platform_version(state.platform.as_ref(), &platform.start_version);
+        if platform_version.is_empty() {
+            failures.push(format!(
+                "{title}: не определена версия платформы 1С — укажите начальную версию платформы (platform.start_version) или установите платформу"
+            ));
+            continue;
+        }
         let update =
             match client.check_conf_update(&conf.program_name, &current, &platform_version) {
                 Ok(Some(update)) => update,
@@ -382,9 +413,10 @@ fn download_configurations(
             failures.push(format!("{title}: в ответе сервиса нет programVersionUin"));
             continue;
         };
-        if update.upgrade_sequence.is_empty() {
-            // Пустая цепочка — ошибка, а не успех: иначе версия была бы записана без файлов,
-            // и следующий запуск счёл бы конфигурацию обновлённой.
+        // Сервис присылает `null`, когда цепочки нет; пустая цепочка — ошибка, а не успех:
+        // иначе версия была бы записана без файлов и следующий запуск счёл бы конфигурацию обновлённой.
+        let sequence = update.sequence();
+        if sequence.is_empty() {
             failures.push(format!(
                 "1С: «{title}»: сервис не вернул цепочку обновлений до {version}"
             ));
@@ -392,9 +424,9 @@ fn download_configurations(
         }
 
         let mut chain_ok = true;
-        for (index, uin) in update.upgrade_sequence.iter().enumerate() {
+        for (index, uin) in sequence.iter().enumerate() {
             ctx.cancel.check()?;
-            let what = format!("«{title}»: звено {} из {}", index + 1, update.upgrade_sequence.len());
+            let what = format!("«{title}»: звено {} из {}", index + 1, sequence.len());
             if let Err(e) = download_chain_item(
                 &client,
                 uin,
@@ -482,7 +514,7 @@ fn download_platform(
     let current =
         DownloadState::current(state.platform.as_ref(), &platform.start_version).to_string();
     if current.is_empty() {
-        // Работать без версии нельзя: сервис ответил бы про пустую версию.
+        // Работать без версии нельзя: сервис отклоняет запрос с пустым platformVersion.
         warnings.push(
             "не задана начальная версия платформы: проверка обновления платформы пропущена".into(),
         );

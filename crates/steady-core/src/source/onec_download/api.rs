@@ -33,11 +33,19 @@ pub struct PlatformUpdate {
 pub struct ConfUpdate {
     /// Версия, до которой предлагается обновиться.
     pub configuration_version: Option<String>,
-    /// Цепочка обновлений: идентификаторы звеньев по порядку.
+    /// Цепочка обновлений: идентификаторы звеньев по порядку. Сервис присылает `null`,
+    /// когда обновления нет, поэтому здесь `Option`, а не `Vec` с одним лишь `default`.
     #[serde(default)]
-    pub upgrade_sequence: Vec<String>,
+    pub upgrade_sequence: Option<Vec<String>>,
     /// Идентификатор версии программы для запроса данных звена.
     pub program_version_uin: Option<String>,
+}
+
+impl ConfUpdate {
+    /// Звенья цепочки; нет поля или `null` — пустая цепочка.
+    pub fn sequence(&self) -> Vec<String> {
+        self.upgrade_sequence.clone().unwrap_or_default()
+    }
 }
 
 /// Данные одного звена цепочки (`configurationUpdateDataList[0]`).

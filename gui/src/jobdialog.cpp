@@ -711,7 +711,10 @@ QWidget *JobDialog::buildSourcePage() {
         auto *platformBox = new QGroupBox(tr("Платформа 1С"));
         auto *plf = new QFormLayout(platformBox);
         m_dlPlatformVersion = new QLineEdit;
-        m_dlPlatformVersion->setPlaceholderText(tr("напр. 8.3.24.1548"));
+        m_dlPlatformVersion->setPlaceholderText(tr("напр. 8.3.24.1548 или пусто — установленная"));
+        m_dlPlatformVersion->setToolTip(
+            tr("Нужна сервису обновлений для проверки конфигураций. Пусто — берётся версия "
+               "установленной платформы 1С."));
         m_dlPlatformAccount = new SteadyCombo;
         m_dlPlatformAccount->setToolTip(tr("Пусто — первая учётная запись ИТС из списка выше."));
         plf->addRow(tr("Начальная версия:"), m_dlPlatformVersion);
