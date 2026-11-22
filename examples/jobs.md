@@ -29,7 +29,10 @@ steady restore a.7z b.7z --target D:\Restore   файлы: полная, зат�
 
 IPC-команды: `status`, `list_jobs`, `get_job {job_id}`, `save_job {job}`, `delete_job {job_id}`,
 `copy_job {job_id}`, `export_settings`, `import_settings {text, replace}`,
-`run_job {job_id}`, `cancel_job {job_id}`, `history {limit}`, `protect {secret}`, `get_settings`, `save_settings {work_dir}`,
+`run_job {job_id}`, `cancel_job {job_id}`, `history {limit}`, `clear_history`, `protect {secret}`, `get_settings`, `save_settings {work_dir}`,
+
+`clear_history` — только администратору: атомарно очищает журнал запусков `history.jsonl` и итоги последних запусков
+в списке заданий. Задания, состояние, резервные копии и текстовые файлы `logs\steady.log*` не удаляются.
 Снимки окон без вашей службы: `steady --data-dir <временный каталог> console` с переменной
 `STEADY_PIPE=<имя>` и GUI с той же переменной (`steady-gui --shots <каталог>`). В консольном режиме GUI
 того же пользователя получает права администратора, а задания этого пользователя загружаются;
@@ -376,9 +379,11 @@ IPC-команда того же назначения — `list_its_configuratio
 
 ## PostgreSQL (pg_dump)
 
-Каждая база — отдельный файл `<база>.dump` в формате `pg_dump -Fc` (уже сжат, 7-Zip только упаковывает).
-Восстановление: `pg_restore -d <база> <файл>.dump`. Пароль задаётся подключением (тип `postgresql`:
-`host`, `port`, `user`, `password`) и передаётся через `PGPASSWORD`, не аргументом командной строки.
+По умолчанию каждая база — отдельный файл `<база>.dump` в формате `pg_dump -Fc` (уже сжат, 7-Zip только упаковывает).
+При `"format": "plain"` создаётся текстовый `<база>.sql` штатным `pg_dump -Fp`, который 7-Zip сжимает обычным образом.
+Восстановление: `pg_restore -d <база> <файл>.dump` для `custom`; `psql -d <база> -f <файл>.sql` для `plain`.
+Пароль задаётся подключением (тип `postgresql`: `host`, `port`, `user`, `password`) и передаётся через `PGPASSWORD`,
+не аргументом командной строки.
 
 ```json
 {
@@ -388,6 +393,7 @@ IPC-команда того же назначения — `list_its_configuratio
     "type": "postgresql",
     "connection": "pg-local",
     "databases": ["erp", "crm"],
+    "format": "custom",
     "globals": true,
     "verify": true
   },
@@ -398,12 +404,15 @@ IPC-команда того же назначения — `list_its_configuratio
 ```
 
 * `databases` пусто — все базы сервера, к которым разрешено подключение (кроме шаблонов).
+* `format`: `custom` (по умолчанию, в том числе для старых JSON без поля) — Dump `.dump` для `pg_restore`;
+  `plain` — SQL-скрипт `.sql` для `psql`. На имена наборов, отдельные архивы и ротацию выбор не влияет.
 * `pg_dump` — полный путь к `pg_dump.exe`; пусто — самая новая версия в `Program Files\PostgreSQL\<версия>\bin`.
   Версия должна быть не старше сервера. `psql.exe`, `pg_restore.exe`, `pg_dumpall.exe` берутся из того же
   каталога; все проверяются на права записи (запуск от SYSTEM).
 * `separate_archives` — каждая база в отдельном архиве (см. раздел MS SQL).
 * `globals` — роли и табличные пространства (`pg_dumpall --globals-only` → `globals.sql`), нужен суперпользователь.
-* `verify` (по умолчанию `true`) — `pg_restore --list` по каждому файлу.
+* `verify` (по умолчанию `true`) — `pg_restore --list` по каждому файлу `custom`. Для `plain` проверка не
+  выполняется: `pg_restore` не читает SQL-скрипты.
 * Вместо `connection` можно указать в источнике `host`, `port`, `user`, `password`. По умолчанию
   `localhost`, `5432`, `postgres`. Тайм-аут по умолчанию — 6 часов на каждый запуск утилиты.
 

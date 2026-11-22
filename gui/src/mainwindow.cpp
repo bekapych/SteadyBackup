@@ -364,10 +364,13 @@ QWidget *MainWindow::buildHistory() {
     m_historyFilter->addItem(tr("Только ошибки и предупреждения"));
     connect(m_historyFilter, &QComboBox::currentIndexChanged, this, [this] { renderHistory(); });
     connect(m_historyOnlyJob, &QCheckBox::toggled, this, [this] { renderHistory(); });
+    auto *clear = new QPushButton(tr("Очистить журнал…"));
+    connect(clear, &QPushButton::clicked, this, &MainWindow::clearHistory);
     bar->addWidget(title);
     bar->addStretch(1);
     bar->addWidget(m_historyOnlyJob);
     bar->addWidget(m_historyFilter);
+    bar->addWidget(clear);
     v->addLayout(bar);
 
     m_history = makeTable({tr("Итог"), tr("Начало"), tr("Длительность"), tr("Задание"), tr("Подробности")});
@@ -1321,6 +1324,20 @@ void MainWindow::deleteJob() {
         return;
     m_client->call({{"cmd", "delete_job"}, {"job_id", id}}, [this](bool ok, const QJsonValue &, const QString &err) {
         if (!ok) showError(err);
+        refresh();
+    });
+}
+
+void MainWindow::clearHistory() {
+    if (!requireAdmin()) return;
+    if (QMessageBox::question(this, tr("Очистка журнала"),
+                              tr("Удалить все записи журнала запусков?\n"
+                                 "Задания и созданные резервные копии не удаляются.")) != QMessageBox::Yes)
+        return;
+    m_client->call({{QStringLiteral("cmd"), QStringLiteral("clear_history")}},
+                   [this](bool ok, const QJsonValue &, const QString &err) {
+        if (!ok) return showError(tr("Не удалось очистить журнал:\n%1").arg(err));
+        statusBar()->showMessage(tr("Журнал запусков очищен"), 5000);
         refresh();
     });
 }

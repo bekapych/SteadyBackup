@@ -892,6 +892,11 @@ QWidget *JobDialog::buildSourcePage() {
         connect(m_pgConn, &ConnectionPicker::changed, this, [this] { loadDatabases("postgresql", true); });
         QWidget *pgButtons = dbButtons(m_pgDatabases, "postgresql");
         m_pgArchives = makeArchiveMode();
+        m_pgFormat = new QComboBox;
+        m_pgFormat->addItem(tr("Dump (custom pg_dump, .dump)"), QStringLiteral("custom"));
+        m_pgFormat->addItem(tr("SQL-скрипт (plain pg_dump, .sql)"), QStringLiteral("plain"));
+        m_pgFormat->setToolTip(tr("Dump восстанавливается через pg_restore. SQL-скрипт — через psql; "
+                                  "текстовый дамп сжимается при упаковке 7-Zip."));
         m_pgStatus = new QLabel;
         m_pgStatus->setWordWrap(true);
         m_pgDump = new QLineEdit;
@@ -907,19 +912,28 @@ QWidget *JobDialog::buildSourcePage() {
         dl->addWidget(m_pgDump, 1);
         dl->addWidget(browse);
         m_pgGlobals = new QCheckBox(tr("Сохранять роли и табличные пространства (pg_dumpall --globals-only)"));
-        m_pgVerify = new QCheckBox(tr("Проверять каждую копию (pg_restore --list)"));
+        m_pgVerify = new QCheckBox(tr("Проверять каждую копию Dump (pg_restore --list)"));
         m_pgVerify->setChecked(true);
+        const auto updatePgVerify = [this] {
+            const bool custom = m_pgFormat->currentData().toString() == QLatin1String("custom");
+            m_pgVerify->setEnabled(custom);
+            m_pgVerify->setToolTip(custom ? QString()
+                                          : tr("pg_restore не читает SQL-скрипты. Для plain-дампа эта проверка не выполняется."));
+        };
+        connect(m_pgFormat, &QComboBox::currentIndexChanged, this, [updatePgVerify](int) { updatePgVerify(); });
+        updatePgVerify();
         f->addRow(tr("Сервер:"), m_pgConn);
         f->addRow(tr("Базы:"), m_pgDatabases);
         f->addRow(QString(), pgButtons);
         f->addRow(QString(), m_pgStatus);
         f->addRow(tr("Архивы:"), m_pgArchives);
+        f->addRow(tr("Формат дампа:"), m_pgFormat);
         f->addRow(tr("pg_dump.exe:"), db);
         f->addRow(m_pgGlobals);
         f->addRow(m_pgVerify);
         auto *hint = new QLabel(tr("Отмеченные базы копируются; ничего не отмечено — все базы сервера, включая новые. "
-                                   "Каждая база сохраняется отдельным файлом .dump (формат pg_dump -Fc); восстановление — "
-                                   "pg_restore. Версия pg_dump должна быть не старше сервера. Пароль передаётся "
+                                   "Каждая база сохраняется отдельным файлом: Dump (.dump) восстанавливается через "
+                                   "pg_restore, SQL-скрипт (.sql) — через psql. Версия pg_dump должна быть не старше сервера. Пароль передаётся "
                                    "через окружение и не виден в командной строке. Роли сохраняются только под "
                                    "суперпользователем. Если одна база не сохранилась, остальные всё равно "
                                    "отправляются, а задание завершается ошибкой."));
@@ -1524,6 +1538,7 @@ void JobDialog::load(const QJsonObject &job) {
         for (const auto &d : s.value("databases").toArray()) dbs << d.toString();
         setDbList(m_pgDatabases, dbs, {});
         m_pgArchives->setCurrentIndex(s.value("separate_archives").toBool(false) ? 1 : 0);
+        m_pgFormat->setCurrentIndex(indexOfData(m_pgFormat, s.value(QStringLiteral("format")).toString("custom")));
         m_pgDump->setText(s.value("pg_dump").toString());
         m_pgGlobals->setChecked(s.value("globals").toBool(false));
         m_pgVerify->setChecked(s.value("verify").toBool(true));
@@ -1760,6 +1775,7 @@ QJsonObject JobDialog::value() const {
         m_pgConn->apply(s);
         s["databases"] = toArray(dbChecked(m_pgDatabases));
         s["separate_archives"] = m_pgArchives->currentData().toBool();
+        s[QStringLiteral("format")] = m_pgFormat->currentData().toString();
         s["pg_dump"] = optString(m_pgDump->text());
         s["globals"] = m_pgGlobals->isChecked();
         s["verify"] = m_pgVerify->isChecked();

@@ -54,6 +54,8 @@ enum Request {
         #[serde(default = "default_limit")]
         limit: usize,
     },
+    /// Очистить видимый в GUI журнал запусков. Копии и остальные данные не удаляются.
+    ClearHistory,
     Protect { secret: String },
     TestDestination { destination: steady_core::Destination },
     /// Список учётных записей Google Drive, авторизованных на этом компьютере.
@@ -452,6 +454,10 @@ fn dispatch(engine: &Arc<Engine>, raw: Value, admin: bool) -> Result<Value> {
             json!(null)
         }
         Request::History { limit } => serde_json::to_value(engine.store.history(limit)?)?,
+        Request::ClearHistory => {
+            engine.store.clear_history()?;
+            Value::Null
+        }
         Request::Protect { secret } => json!(steady_core::secret::protect_str(&secret)?),
         Request::TestDestination { destination } => {
             let mut t = steady_core::destination::open(&destination, &engine.data_dir)?;
@@ -1053,5 +1059,14 @@ mod tests {
             Request::DeleteStorage { id } => assert_eq!(id, "nas"),
             _ => panic!("ожидалось удаление хранилища"),
         }
+    }
+
+    #[test]
+    fn clear_history_is_admin_only() {
+        let dir = std::env::temp_dir().join(format!("steady-clear-history-{}", Uuid::new_v4().simple()));
+        let engine = Engine::new(dir.clone(), None, true);
+        let err = dispatch(&engine, json!({"cmd": "clear_history"}), false).unwrap_err();
+        assert!(err.to_string().contains("только администраторам"), "{err}");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -25,6 +25,8 @@ pub struct Store {
     pub require_admin_owner: bool,
     /// Последняя запись журнала по заданию. Заполняется хвостом файла, не всем журналом.
     last: std::sync::Mutex<HistoryCache>,
+    /// Сериализует дописывание и очистку: завершение задания может совпасть с командой IPC.
+    history_io: std::sync::Mutex<()>,
 }
 
 struct HistoryCache {
@@ -50,12 +52,22 @@ pub struct HistoryEntry {
 
 impl Store {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), require_admin_owner: false, last: std::sync::Mutex::new(HistoryCache { ready: false, by_job: HashMap::new() }) }
+        Self {
+            dir: dir.into(),
+            require_admin_owner: false,
+            last: std::sync::Mutex::new(HistoryCache { ready: false, by_job: HashMap::new() }),
+            history_io: std::sync::Mutex::new(()),
+        }
     }
 
     /// Хранилище службы: задания чужих владельцев не загружаются.
     pub fn for_service(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), require_admin_owner: true, last: std::sync::Mutex::new(HistoryCache { ready: false, by_job: HashMap::new() }) }
+        Self {
+            dir: dir.into(),
+            require_admin_owner: true,
+            last: std::sync::Mutex::new(HistoryCache { ready: false, by_job: HashMap::new() }),
+            history_io: std::sync::Mutex::new(()),
+        }
     }
 
     fn jobs_dir(&self) -> PathBuf {
@@ -120,6 +132,7 @@ impl Store {
     }
 
     pub fn append_history(&self, h: &HistoryEntry) -> Result<()> {
+        let _io = self.history_io.lock().unwrap();
         std::fs::create_dir_all(&self.dir)?;
         let p = self.dir.join("history.jsonl");
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&p)?;
@@ -160,6 +173,17 @@ impl Store {
     /// Последние `limit` записей журнала (новые в конце). Читается хвост файла, не весь журнал.
     pub fn history(&self, limit: usize) -> Result<Vec<HistoryEntry>> {
         read_history_tail(&self.dir.join("history.jsonl"), limit)
+    }
+
+    /// Атомарно очищает только журнал запусков и кэш последних итогов.
+    /// Задания, состояние, копии и текстовые журналы службы не затрагиваются.
+    pub fn clear_history(&self) -> Result<()> {
+        let _io = self.history_io.lock().unwrap();
+        crate::util::write_atomic(&self.dir.join("history.jsonl"), b"")?;
+        let mut cache = self.last.lock().unwrap();
+        cache.by_job.clear();
+        cache.ready = true;
+        Ok(())
     }
 
     pub fn load_marks(&self) -> HashMap<Uuid, chrono::NaiveDateTime> {
@@ -363,6 +387,51 @@ mod tests {
         assert!(tail[1].finished > tail[0].finished);
         let store = Store::new(&d);
         assert_eq!(store.last(&id).unwrap().finished, tail[1].finished);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn clear_history_resets_last_and_preserves_other_files() {
+        let d = tmp();
+        let store = Store::new(&d);
+        let id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let entry = |second: u32| HistoryEntry {
+            job_id: id,
+            job: "t".into(),
+            started: chrono::DateTime::parse_from_rfc3339("2026-11-10T10:00:00+03:00").unwrap().into(),
+            finished: chrono::DateTime::parse_from_rfc3339(&format!("2026-11-10T10:00:{second:02}+03:00")).unwrap().into(),
+            ok: true,
+            warnings: vec![],
+            error: None,
+            report: None,
+        };
+        store.append_history(&entry(1)).unwrap();
+        assert!(store.last(&id).is_some());
+
+        let protected = [
+            ("jobs/a.json", b"job".as_slice()),
+            ("state/a.json", b"state".as_slice()),
+            ("logs/steady.log", b"current log".as_slice()),
+            ("logs/steady.log.2026-11-09.gz", b"rotated log".as_slice()),
+            ("keep.txt", b"keep".as_slice()),
+        ];
+        for (name, body) in protected {
+            let path = d.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+        }
+
+        store.clear_history().unwrap();
+        assert!(store.history(10).unwrap().is_empty());
+        assert!(store.last(&id).is_none(), "кэш последнего запуска должен быть очищен");
+        assert_eq!(std::fs::metadata(d.join("history.jsonl")).unwrap().len(), 0);
+        for (name, body) in protected {
+            assert_eq!(std::fs::read(d.join(name)).unwrap(), body, "посторонний файл изменён: {name}");
+        }
+
+        store.append_history(&entry(2)).unwrap();
+        assert_eq!(store.history(10).unwrap().len(), 1);
+        assert_eq!(store.last(&id).unwrap().finished, entry(2).finished);
         std::fs::remove_dir_all(&d).ok();
     }
 }

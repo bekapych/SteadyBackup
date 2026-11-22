@@ -1,11 +1,12 @@
-//! PostgreSQL: `pg_dump -Fc` по каждой базе, по желанию роли через `pg_dumpall --globals-only`.
+//! PostgreSQL: `pg_dump -Fc` (`.dump`) или `pg_dump -Fp` (`.sql`) по каждой базе,
+//! по желанию роли через `pg_dumpall --globals-only`.
 //!
 //! Пароль передаётся переменной PGPASSWORD, не аргументом: иначе он виден в списке процессов.
 //! Утилиты берутся из одного каталога `bin` установки PostgreSQL и перед запуском проверяются
 //! `acl::check_trusted_exe`: служба запускает их от SYSTEM.
 
 use super::{dir_size, Prepared};
-use crate::job::BackupKind;
+use crate::job::{BackupKind, PgDumpFormat};
 use crate::state::JobState;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -18,11 +19,36 @@ pub struct PgParams<'a> {
     pub password: Option<&'a str>,
     pub databases: &'a [String],
     pub pg_dump: Option<&'a str>,
+    pub format: PgDumpFormat,
     pub globals: bool,
     pub verify: bool,
     pub timeout: std::time::Duration,
     /// Попыток каждой базы.
     pub attempts: u32,
+}
+
+impl PgDumpFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Custom => "dump",
+            Self::Plain => "sql",
+        }
+    }
+
+    fn arg(self) -> &'static str {
+        match self {
+            Self::Custom => "c",
+            Self::Plain => "p",
+        }
+    }
+
+    fn packed(self) -> bool {
+        matches!(self, Self::Custom)
+    }
+
+    fn supports_pg_restore(self) -> bool {
+        matches!(self, Self::Custom)
+    }
 }
 
 /// Базы, которые нельзя открыть или нет смысла копировать при выборе «все базы».
@@ -56,8 +82,24 @@ pub fn list_databases(
 ) -> Result<Vec<String>> {
     let pg_dump_path = locate_pg_dump(pg_dump)?;
     let bin = pg_dump_path.parent().context("PostgreSQL: каталог pg_dump")?.to_path_buf();
-    let p = PgParams { host, port, user, password, databases: &[], pg_dump, globals: false, verify: false, timeout, attempts: 1 };
+    let p = PgParams {
+        host,
+        port,
+        user,
+        password,
+        databases: &[],
+        pg_dump,
+        format: PgDumpFormat::Custom,
+        globals: false,
+        verify: false,
+        timeout,
+        attempts: 1,
+    };
     server_databases(&bin, &p)
+}
+
+fn dump_file(staging: &Path, label: &str, format: PgDumpFormat) -> PathBuf {
+    staging.join(format!("{label}.{}", format.extension()))
 }
 
 pub fn prepare(p: &PgParams, staging: &Path) -> Result<Prepared> {
@@ -80,7 +122,7 @@ pub fn prepare(p: &PgParams, staging: &Path) -> Result<Prepared> {
     let mut failures = Vec::new();
     for (db, label) in databases.iter().zip(&labels) {
         crate::process::check_cancel()?;
-        let file = staging.join(format!("{label}.dump"));
+        let file = dump_file(staging, label, p.format);
         let res = crate::util::retry(&format!("PostgreSQL: база {db}"), p.attempts, pause, || {
             let r = dump_one(p, &pg_dump, &bin, db, &file);
             if r.is_err() {
@@ -127,23 +169,28 @@ pub fn prepare(p: &PgParams, staging: &Path) -> Result<Prepared> {
         items,
         bytes,
         warnings: vec![],
-        // Формат -Fc уже сжат: 7-Zip только упаковывает (пароль, тома).
-        packed: true,
+        // -Fc уже сжат: 7-Zip только упаковывает. Текстовый -Fp, наоборот, должен сжиматься.
+        packed: p.format.packed(),
         parts,
         failures,
     })
 }
 
-/// pg_dump одной базы в `file` и, по желанию, проверка чтением оглавления.
+fn dump_command(p: &PgParams, pg_dump: &Path, db: &str, file: &Path) -> Command {
+    let mut cmd = base_command(pg_dump, p);
+    cmd.args(["-F", p.format.arg(), "-f"]).arg(file).arg("-d").arg(conninfo(db));
+    cmd
+}
+
+/// pg_dump одной базы в `file` и, для custom по желанию, проверка чтением оглавления.
 fn dump_one(p: &PgParams, pg_dump: &Path, bin: &Path, db: &str, file: &Path) -> Result<()> {
     tracing::info!("PostgreSQL: pg_dump {db}");
-    let mut cmd = base_command(pg_dump, p);
-    cmd.args(["-F", "c", "-f"]).arg(file).arg("-d").arg(conninfo(db));
+    let cmd = dump_command(p, pg_dump, db, file);
     run(cmd, p.timeout, &format!("PostgreSQL: pg_dump {db}"))?;
     if !file.is_file() {
         bail!("PostgreSQL: pg_dump не создал {}", file.display());
     }
-    if p.verify {
+    if p.verify && p.format.supports_pg_restore() {
         let pg_restore = tool(bin, "pg_restore.exe")?;
         let mut cmd = Command::new(&pg_restore);
         cmd.current_dir(bin).arg("--list").arg(file);
@@ -279,6 +326,54 @@ mod tests {
         let t = failure_text(b"", b"pg_dump: error: connection failed\npg_dump: detail: password authentication failed\n");
         assert!(t.contains("password authentication failed"), "{t}");
         assert_eq!(failure_text(b"", b""), "завершился с ошибкой без текста");
+    }
+
+    #[test]
+    fn dump_format_defaults_to_custom_and_deserializes_plain() {
+        let old: crate::Source = serde_json::from_str(r#"{"type":"postgresql"}"#).unwrap();
+        assert!(matches!(old, crate::Source::PostgreSql { format: crate::job::PgDumpFormat::Custom, .. }));
+
+        let plain: crate::Source = serde_json::from_str(r#"{"type":"postgresql","format":"plain"}"#).unwrap();
+        assert!(matches!(plain, crate::Source::PostgreSql { format: crate::job::PgDumpFormat::Plain, .. }));
+        assert_eq!(serde_json::to_value(plain).unwrap()["format"], "plain");
+    }
+
+    #[test]
+    fn dump_arguments_and_extension_match_format() {
+        use crate::job::PgDumpFormat;
+
+        for (format, expected_arg, expected_ext) in [(PgDumpFormat::Custom, "c", "dump"), (PgDumpFormat::Plain, "p", "sql")] {
+            let p = PgParams {
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                databases: &[],
+                pg_dump: None,
+                globals: false,
+                verify: true,
+                timeout: std::time::Duration::from_secs(60),
+                attempts: 1,
+                format,
+            };
+            let file = dump_file(Path::new("staging"), "erp", format);
+            assert_eq!(file.extension().and_then(|s| s.to_str()), Some(expected_ext));
+            let cmd = dump_command(&p, Path::new("pg_dump.exe"), "erp", &file);
+            let args: Vec<String> = cmd.get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+            let format_pos = args.iter().position(|s| s == "-F").unwrap();
+            assert_eq!(args[format_pos + 1], expected_arg);
+            assert!(args.windows(2).any(|w| w[0] == "-f" && Path::new(&w[1]) == file));
+        }
+    }
+
+    #[test]
+    fn plain_sql_is_compressed_and_not_verified_with_pg_restore() {
+        use crate::job::PgDumpFormat;
+
+        assert!(PgDumpFormat::Custom.packed());
+        assert!(PgDumpFormat::Custom.supports_pg_restore());
+        assert!(!PgDumpFormat::Plain.packed());
+        assert!(!PgDumpFormat::Plain.supports_pg_restore());
     }
 
     /// Старые задания не затронуты, новое задание читается с умолчаниями.

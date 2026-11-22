@@ -262,6 +262,16 @@ impl Destination {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PgDumpFormat {
+    /// Собственный сжатый формат `pg_dump -Fc`, файл `<база>.dump`; восстановление через `pg_restore`.
+    #[default]
+    Custom,
+    /// Текстовый SQL-скрипт `pg_dump -Fp`, файл `<база>.sql`; восстановление через `psql`.
+    Plain,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackupKind {
@@ -515,8 +525,8 @@ pub enum Source {
         #[serde(default = "yes")]
         verify: bool,
     },
-    /// Базы PostgreSQL через pg_dump в собственном формате (`-Fc`), по файлу `<база>.dump` на базу.
-    /// Восстановление — `pg_restore`.
+    /// Базы PostgreSQL через pg_dump: собственный формат (`-Fc`, `.dump`) или SQL-скрипт (`-Fp`, `.sql`).
+    /// Восстановление — `pg_restore` для `custom` и `psql` для `plain`.
     #[serde(rename = "postgresql")]
     PostgreSql {
         /// Подключение (сервер, порт, пользователь, пароль). Если задано — поля ниже не используются.
@@ -541,11 +551,16 @@ pub enum Source {
         /// pg_dump должен быть не старше сервера. Рядом должны лежать psql.exe, pg_restore.exe и pg_dumpall.exe.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pg_dump: Option<String>,
+        /// Формат каждой базы: `custom` — `<база>.dump` (`-Fc`, восстановление `pg_restore`),
+        /// `plain` — `<база>.sql` (`-Fp`, восстановление `psql`). Старые задания — `custom`.
+        #[serde(default)]
+        format: PgDumpFormat,
         /// Дополнительно сохранить роли и табличные пространства (`pg_dumpall --globals-only`
         /// в `globals.sql`). Нужны права суперпользователя.
         #[serde(default)]
         globals: bool,
-        /// Проверять каждый файл чтением оглавления (`pg_restore --list`).
+        /// Проверять каждый файл `custom` чтением оглавления (`pg_restore --list`).
+        /// Для `plain` не применяется: `pg_restore` не читает SQL-скрипты.
         #[serde(default = "yes")]
         verify: bool,
         /// Каждую базу — в отдельный архив (`<набор>.<база>.7z`, роли — `<набор>.globals.7z`).

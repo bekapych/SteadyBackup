@@ -107,6 +107,7 @@ private:
     QPushButton *m_dlItsPick = nullptr; // «Выбрать из ИТС…» (список конфигураций учётной записи)
     QListWidget *m_sqlDatabases; // отмеченные базы; ничего не отмечено — все пользовательские базы
     QComboBox *m_sqlArchives, *m_pgArchives; // данные: false — один архив, true — по архиву на базу
+    QComboBox *m_pgFormat; // custom — Dump для pg_restore, plain — SQL-скрипт для psql
     QLineEdit *m_sqlDir;
     QLabel *m_sqlStatus;
     ConnectionPicker *m_sqlConn;

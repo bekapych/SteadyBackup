@@ -78,6 +78,7 @@ private:
     void deleteJob();
     void runJob();
     void cancelJob();
+    void clearHistory();
     void saveJob(const QJsonObject &job);
     void showError(const QString &text);
     // Права администратора нужны для изменений; предлагает перезапуск с повышением (UAC).

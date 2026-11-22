@@ -138,7 +138,7 @@ pub fn prepare(
             },
             staging,
         ),
-        Source::PostgreSql { host, port, user, password, databases, pg_dump, globals, verify, .. } => {
+        Source::PostgreSql { host, port, user, password, databases, pg_dump, format, globals, verify, .. } => {
             postgres::prepare(
                 &postgres::PgParams {
                     host: host.as_deref(),
@@ -147,6 +147,7 @@ pub fn prepare(
                     password: reveal_opt(password.as_deref())?.as_deref(),
                     databases,
                     pg_dump: pg_dump.as_deref(),
+                    format: *format,
                     globals: *globals,
                     verify: *verify,
                     timeout,
